@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,6 +20,7 @@ import (
 type config struct {
 	document      string
 	ompPath       string
+	model         string
 	extraArgs     []string
 	maxIterations int
 	stallLimit    int
@@ -53,32 +58,96 @@ Environment:
 `
 
 func main() {
-	if helpRequested(os.Args[1:]) {
-		fmt.Print(usage)
-		return
+	if exitCode := run(os.Args[1:], os.Stdin, os.Stdout); exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func run(args []string, input io.Reader, output io.Writer) int {
+	if helpRequested(args) {
+		fmt.Fprint(output, usage)
+		return 0
 	}
 
-	cfg, err := loadConfig(os.Args[1:])
+	cfg, err := loadConfig(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "looptui:", err)
-		os.Exit(1)
+		return 1
 	}
 
 	app, err := newModel(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "looptui:", err)
-		os.Exit(1)
+		return 1
+	}
+
+	keepAwake, err := promptCaffeinate(input, output)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "looptui:", err)
+		return 1
+	}
+	if keepAwake {
+		caffeinate, err := startCaffeinate()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "looptui:", err)
+			return 1
+		}
+		defer stopCaffeinate(caffeinate)
 	}
 
 	program := tea.NewProgram(app, tea.WithAltScreen())
 	final, err := program.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "looptui:", err)
-		os.Exit(1)
+		return 1
 	}
-	if m, ok := final.(model); ok && m.exitCode != 0 {
-		os.Exit(m.exitCode)
+	if m, ok := final.(model); ok {
+		return m.exitCode
 	}
+	return 0
+}
+
+func promptCaffeinate(input io.Reader, output io.Writer) (bool, error) {
+	reader := bufio.NewReader(input)
+	for {
+		fmt.Fprint(output, "Keep computer alive with caffeinate? [yes/no] ")
+		answer, err := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "yes", "y":
+			return true, nil
+		case "no", "n":
+			return false, nil
+		}
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("read caffeinate choice: %w", err)
+		}
+		fmt.Fprintln(output, "Please answer yes or no.")
+	}
+}
+
+func startCaffeinate() (*exec.Cmd, error) {
+	path, err := exec.LookPath("caffeinate")
+	if err != nil {
+		return nil, fmt.Errorf("'caffeinate' command not found in PATH")
+	}
+	cmd := exec.Command(path, "-d", "-i", "-w", strconv.Itoa(os.Getpid()))
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start caffeinate: %w", err)
+	}
+	return cmd, nil
+}
+
+func stopCaffeinate(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		_ = cmd.Process.Kill()
+	}
+	_ = cmd.Wait()
 }
 
 func helpRequested(args []string) bool {
@@ -153,7 +222,110 @@ func loadConfig(args []string) (config, error) {
 			return cfg, errors.New("'omp' command not found in PATH")
 		}
 	}
+
+	cfg.model = parseModelFromArgs(cfg.extraArgs)
+	if cfg.model == "" {
+		cfg.model = detectModelFromEnv()
+	}
+	if cfg.model == "" {
+		cfg.model = detectModelFromConfig()
+	}
+
 	return cfg, nil
+}
+
+func parseModelFromArgs(args []string) string {
+	model := ""
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if (arg == "--model" || arg == "-m") && i+1 < len(args) {
+			model = args[i+1]
+			skipNext = true
+		} else if strings.HasPrefix(arg, "--model=") {
+			model = strings.TrimPrefix(arg, "--model=")
+		} else if strings.HasPrefix(arg, "-m=") {
+			model = strings.TrimPrefix(arg, "-m=")
+		}
+	}
+	return strings.TrimSpace(model)
+}
+
+func detectModelFromEnv() string {
+	for _, env := range []string{"OMP_MODEL", "PI_MODEL", "MODEL"} {
+		if val := strings.TrimSpace(os.Getenv(env)); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func detectModelFromConfig() string {
+	agentDir := os.Getenv("PI_CODING_AGENT_DIR")
+	if agentDir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			agentDir = filepath.Join(home, ".omp", "agent")
+		}
+	}
+	if agentDir != "" {
+		configPath := filepath.Join(agentDir, "config.yml")
+		if model := parseDefaultModelFromFile(configPath); model != "" {
+			return model
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		configPath := filepath.Join(home, ".config", "omp", "agent", "config.yml")
+		if model := parseDefaultModelFromFile(configPath); model != "" {
+			return model
+		}
+	}
+	return ""
+}
+
+func parseDefaultModelFromFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return parseDefaultModelFromYAML(data)
+}
+
+func parseDefaultModelFromYAML(data []byte) string {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	inModelRoles := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(line, "modelRoles:") {
+			inModelRoles = true
+			continue
+		}
+		if inModelRoles {
+			if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+				inModelRoles = false
+				continue
+			}
+			if strings.HasPrefix(trimmed, "default:") {
+				val := strings.TrimSpace(strings.TrimPrefix(trimmed, "default:"))
+				val = strings.Trim(val, `"'`)
+				if val != "" {
+					return val
+				}
+			}
+		} else if strings.HasPrefix(trimmed, "model:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "model:"))
+			val = strings.Trim(val, `"'`)
+			if val != "" {
+				return val
+			}
+		}
+	}
+	return ""
 }
 
 func fileExists(path string) bool {

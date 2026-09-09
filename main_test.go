@@ -86,6 +86,61 @@ func TestHelpIsAvailableWithoutDocumentOrOmp(t *testing.T) {
 	}
 }
 
+func TestPromptCaffeinateAcceptsYesAndNo(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{input: "yes\n", want: true},
+		{input: "Y\n", want: true},
+		{input: "no\n", want: false},
+		{input: "N\n", want: false},
+		{input: "", want: false},
+	}
+
+	for _, tt := range tests {
+		var output strings.Builder
+		got, err := promptCaffeinate(strings.NewReader(tt.input), &output)
+		if err != nil {
+			t.Fatalf("promptCaffeinate(%q): %v", tt.input, err)
+		}
+		if got != tt.want {
+			t.Errorf("promptCaffeinate(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+		if output.String() != "Keep computer alive with caffeinate? [yes/no] " {
+			t.Errorf("unexpected prompt: %q", output.String())
+		}
+	}
+}
+
+func TestPromptCaffeinateRepeatsForInvalidAnswer(t *testing.T) {
+	var output strings.Builder
+	got, err := promptCaffeinate(strings.NewReader("maybe\nyes\n"), &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("valid answer after retry was not accepted")
+	}
+	want := "Keep computer alive with caffeinate? [yes/no] Please answer yes or no.\nKeep computer alive with caffeinate? [yes/no] "
+	if output.String() != want {
+		t.Fatalf("unexpected prompt output: %q", output.String())
+	}
+}
+
+func TestStopCaffeinateTerminatesChild(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	stopCaffeinate(cmd)
+
+	if cmd.ProcessState == nil {
+		t.Fatal("caffeinate child was not reaped")
+	}
+}
+
 func TestRenderOMPEvent(t *testing.T) {
 	tool := renderOMPEvent([]byte(`{"type":"tool_execution_start","toolName":"read","args":{"i":"Reading service"}}`))
 	if len(tool) != 1 || tool[0].kind != outputText || tool[0].text != "> read · Reading service" {
@@ -325,5 +380,270 @@ func TestSplitTaskAndIssue(t *testing.T) {
 		if gotTask != tt.wantTask || gotIssue != tt.wantIssue {
 			t.Errorf("splitTaskAndIssue(%q) = (%q, %q), want (%q, %q)", tt.input, gotTask, gotIssue, tt.wantTask, tt.wantIssue)
 		}
+	}
+}
+func TestParseModelFromArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "space separated long flag",
+			args: []string{"--model", "opus"},
+			want: "opus",
+		},
+		{
+			name: "equal separated long flag",
+			args: []string{"--model=claude-3-7-sonnet"},
+			want: "claude-3-7-sonnet",
+		},
+		{
+			name: "space separated short flag",
+			args: []string{"-m", "gpt-4o"},
+			want: "gpt-4o",
+		},
+		{
+			name: "equal separated short flag",
+			args: []string{"-m=gemini-2.5"},
+			want: "gemini-2.5",
+		},
+		{
+			name: "multiple flags uses last",
+			args: []string{"--model", "opus", "-m=sonnet"},
+			want: "sonnet",
+		},
+		{
+			name: "no model flag",
+			args: []string{"--auto-approve", "extra"},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseModelFromArgs(tt.args)
+			if got != tt.want {
+				t.Errorf("parseModelFromArgs(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDefaultModelFromYAML(t *testing.T) {
+	yamlWithRoles := []byte(`
+setupVersion: 2
+modelRoles:
+  smol: google-antigravity/gemini-3.5-flash-lite
+  default: google-antigravity/gemini-3.8-flash:high
+  advisor: anthropic/claude-opus-5
+`)
+	if got := parseDefaultModelFromYAML(yamlWithRoles); got != "google-antigravity/gemini-3.8-flash:high" {
+		t.Errorf("parseDefaultModelFromYAML(yamlWithRoles) = %q, want %q", got, "google-antigravity/gemini-3.8-flash:high")
+	}
+
+	yamlWithTopLevel := []byte(`
+model: "anthropic/claude-3-5-sonnet"
+`)
+	if got := parseDefaultModelFromYAML(yamlWithTopLevel); got != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("parseDefaultModelFromYAML(yamlWithTopLevel) = %q, want %q", got, "anthropic/claude-3-5-sonnet")
+	}
+
+	yamlEmpty := []byte(``)
+	if got := parseDefaultModelFromYAML(yamlEmpty); got != "" {
+		t.Errorf("parseDefaultModelFromYAML(empty) = %q, want empty", got)
+	}
+}
+
+func TestRenderOMPEventExtractsModel(t *testing.T) {
+	modelChange := renderOMPEvent([]byte(`{"type":"model_change","model":"google-antigravity/gemini-3.8-flash"}`))
+	if len(modelChange) != 1 || modelChange[0].kind != outputModel || modelChange[0].text != "google-antigravity/gemini-3.8-flash" {
+		t.Fatalf("unexpected model_change event: %#v", modelChange)
+	}
+
+	msgStart := renderOMPEvent([]byte(`{"type":"message_start","message":{"role":"assistant","model":"gemini-3.8-flash"}}`))
+	if len(msgStart) != 1 || msgStart[0].kind != outputModel || msgStart[0].text != "gemini-3.8-flash" {
+		t.Fatalf("unexpected message_start event: %#v", msgStart)
+	}
+
+	combined := renderOMPEvent([]byte(`{"type":"message_update","model":"gemini-3.8-flash","assistantMessageEvent":{"type":"text_delta","delta":"done"}}`))
+	if len(combined) != 2 {
+		t.Fatalf("expected 2 outputs for combined event, got %d: %#v", len(combined), combined)
+	}
+	if combined[0].kind != outputModel || combined[0].text != "gemini-3.8-flash" {
+		t.Errorf("unexpected first output: %#v", combined[0])
+	}
+	if combined[1].kind != outputDelta || combined[1].text != "done" {
+		t.Errorf("unexpected second output: %#v", combined[1])
+	}
+}
+
+func TestRenderHeaderTitle(t *testing.T) {
+	m := model{modelName: "google-antigravity/gemini-3.8-flash:high"}
+	base := " LOOP test.md"
+
+	// Generous width: shows full model
+	wide := m.renderHeaderTitle(base, 80)
+	if !strings.Contains(wide, "google-antigravity/gemini-3.8-flash:high") {
+		t.Errorf("expected full model in wide header, got %q", wide)
+	}
+
+	// Medium width: strips provider prefix
+	medium := m.renderHeaderTitle(base, 45)
+	if !strings.Contains(medium, "gemini-3.8-flash:high") || strings.Contains(medium, "google-antigravity") {
+		t.Errorf("expected stripped provider in medium header, got %q", medium)
+	}
+
+	// Very tight width: drops model rather than overflowing base
+	tiny := m.renderHeaderTitle(base, 15)
+	if strings.Contains(tiny, "gemini") {
+		t.Errorf("expected model dropped in tiny header, got %q", tiny)
+	}
+	if !strings.Contains(tiny, "LOOP") {
+		t.Errorf("expected base title preserved in tiny header, got %q", tiny)
+	}
+
+	// Empty modelName: renders base
+	mEmpty := model{}
+	empty := mEmpty.renderHeaderTitle(base, 80)
+	if !strings.Contains(empty, "LOOP test.md") || strings.Contains(empty, "·") {
+		t.Errorf("expected bare base title when model empty, got %q", empty)
+	}
+}
+
+func TestHeaderViewIncludesModel(t *testing.T) {
+	m := model{
+		cfg:       config{document: "/tmp/migration.md"},
+		modelName: "gemini-3.8-flash",
+		doc:       document{done: 2, total: 5},
+	}
+
+	runnerHeader := m.headerView(80)
+	if !strings.Contains(runnerHeader, "migration.md") {
+		t.Errorf("expected document in header, got %q", runnerHeader)
+	}
+	if !strings.Contains(runnerHeader, "gemini-3.8-flash") {
+		t.Errorf("expected model in runner header, got %q", runnerHeader)
+	}
+	if !strings.Contains(runnerHeader, "2/5 complete") {
+		t.Errorf("expected progress in runner header, got %q", runnerHeader)
+	}
+
+	reviewHeader := m.reviewHeaderView(80, 1)
+	if !strings.Contains(reviewHeader, "Review Mode") {
+		t.Errorf("expected Review Mode in header, got %q", reviewHeader)
+	}
+	if !strings.Contains(reviewHeader, "gemini-3.8-flash") {
+		t.Errorf("expected model in review header, got %q", reviewHeader)
+	}
+}
+func TestLoadConfigWithModel(t *testing.T) {
+	tempDoc := filepath.Join(t.TempDir(), "test-plan.md")
+	if err := os.WriteFile(tempDoc, []byte("# Test\n## S1\n- [ ] task\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig([]string{tempDoc, "--model", "opus"})
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+
+	if cfg.model != "opus" {
+		t.Errorf("cfg.model = %q, want %q", cfg.model, "opus")
+	}
+	if !reflect.DeepEqual(cfg.extraArgs, []string{"--model", "opus"}) {
+		t.Errorf("cfg.extraArgs = %#v, want %#v", cfg.extraArgs, []string{"--model", "opus"})
+	}
+
+	cfgPlain, err := loadConfig([]string{tempDoc})
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	// Verify extraArgs does NOT contain --model injected
+	for _, arg := range cfgPlain.extraArgs {
+		if arg == "--model" || arg == "-m" {
+			t.Errorf("unexpected model flag injected into extraArgs: %#v", cfgPlain.extraArgs)
+		}
+	}
+}
+func TestViewRendersModelInRunnerAndReviewModes(t *testing.T) {
+	tempDoc := filepath.Join(t.TempDir(), "test-view.md")
+	content := `# Project
+## Section 1
+- [ ] pending task
+- [!] blocked task — need user confirmation
+`
+	if err := os.WriteFile(tempDoc, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config{
+		document:  tempDoc,
+		model:     "opus",
+		extraArgs: []string{"--model", "opus"},
+	}
+
+	m, err := newModel(cfg)
+	if err != nil {
+		t.Fatalf("newModel failed: %v", err)
+	}
+	m.width = 100
+	m.height = 30
+
+	runnerView := m.View()
+	if !strings.Contains(runnerView, "test-view.md") {
+		t.Errorf("runner view missing document: %q", runnerView)
+	}
+	if !strings.Contains(runnerView, "opus") {
+		t.Errorf("runner view missing model: %q", runnerView)
+	}
+
+	m.mode = modeReview
+	reviewView := m.View()
+	if !strings.Contains(reviewView, "test-view.md") {
+		t.Errorf("review view missing document: %q", reviewView)
+	}
+	if !strings.Contains(reviewView, "Review Mode") {
+		t.Errorf("review view missing Review Mode: %q", reviewView)
+	}
+	if !strings.Contains(reviewView, "opus") {
+		t.Errorf("review view missing model: %q", reviewView)
+	}
+}
+
+func TestDemoDocumentParsing(t *testing.T) {
+	doc, err := readDocument("demo.md")
+	if err != nil {
+		t.Fatalf("failed to read demo.md: %v", err)
+	}
+	if doc.total != 15 {
+		t.Errorf("expected 15 total tasks, got %d", doc.total)
+	}
+	if doc.done != 2 {
+		t.Errorf("expected 2 done tasks, got %d", doc.done)
+	}
+	if doc.blocked != 1 {
+		t.Errorf("expected 1 blocked task, got %d", doc.blocked)
+	}
+	if doc.pending != 12 {
+		t.Errorf("expected 12 pending tasks, got %d", doc.pending)
+	}
+	if len(doc.sections) != 4 {
+		t.Errorf("expected 4 sections, got %d", len(doc.sections))
+	}
+	next, ok := doc.nextSection()
+	if !ok || next.title != "Phase 1: Database & Storage Engine" {
+		t.Errorf("expected next section to be Phase 1, got %+v", next)
+	}
+	blocked := doc.blockedTasks()
+	if len(blocked) != 1 {
+		t.Fatalf("expected 1 blocked task, got %d", len(blocked))
+	}
+	taskPart, issuePart := splitTaskAndIssue(blocked[0].text)
+	if !strings.Contains(taskPart, "Configure production SendGrid API key") {
+		t.Errorf("unexpected task part: %q", taskPart)
+	}
+	if !strings.Contains(issuePart, "Requires administrator to provision production credential from vault") {
+		t.Errorf("unexpected issue part: %q", issuePart)
 	}
 }

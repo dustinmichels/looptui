@@ -20,6 +20,7 @@ const (
 	outputText outputKind = iota
 	outputDelta
 	outputDone
+	outputModel
 )
 
 type agentOutput struct {
@@ -44,6 +45,7 @@ type agentOutputMsg struct {
 
 type ompEvent struct {
 	Type                  string          `json:"type"`
+	Model                 string          `json:"model,omitempty"`
 	ToolName              string          `json:"toolName,omitempty"`
 	Intent                string          `json:"intent,omitempty"`
 	Args                  json.RawMessage `json:"args,omitempty"`
@@ -52,6 +54,11 @@ type ompEvent struct {
 		Type  string `json:"type"`
 		Delta string `json:"delta,omitempty"`
 	} `json:"assistantMessageEvent,omitempty"`
+	Message *struct {
+		Role     string `json:"role,omitempty"`
+		Model    string `json:"model,omitempty"`
+		Provider string `json:"provider,omitempty"`
+	} `json:"message,omitempty"`
 }
 
 func startAgent(cfg config, target section) tea.Cmd {
@@ -164,6 +171,16 @@ func renderOMPEvent(line []byte) []agentOutput {
 		return []agentOutput{{kind: outputText, text: string(line)}}
 	}
 
+	var outputs []agentOutput
+
+	model := event.Model
+	if model == "" && event.Message != nil && event.Message.Model != "" && (event.Message.Role == "" || event.Message.Role == "assistant") {
+		model = event.Message.Model
+	}
+	if model != "" {
+		outputs = append(outputs, agentOutput{kind: outputModel, text: model})
+	}
+
 	switch event.Type {
 	case "tool_execution_start":
 		intent := event.Intent
@@ -177,19 +194,19 @@ func renderOMPEvent(line []byte) []agentOutput {
 		if intent == "" {
 			intent = "running"
 		}
-		return []agentOutput{{kind: outputText, text: fmt.Sprintf("> %s · %s", event.ToolName, intent)}}
+		outputs = append(outputs, agentOutput{kind: outputText, text: fmt.Sprintf("> %s · %s", event.ToolName, intent)})
 	case "tool_execution_end":
 		marker := "+"
 		if event.IsError {
 			marker = "x"
 		}
-		return []agentOutput{{kind: outputText, text: fmt.Sprintf("%s %s", marker, event.ToolName)}}
+		outputs = append(outputs, agentOutput{kind: outputText, text: fmt.Sprintf("%s %s", marker, event.ToolName)})
 	case "message_update":
 		if event.AssistantMessageEvent != nil && event.AssistantMessageEvent.Type == "text_delta" && event.AssistantMessageEvent.Delta != "" {
-			return []agentOutput{{kind: outputDelta, text: event.AssistantMessageEvent.Delta}}
+			outputs = append(outputs, agentOutput{kind: outputDelta, text: event.AssistantMessageEvent.Delta})
 		}
 	}
-	return nil
+	return outputs
 }
 
 func waitForAgent(events <-chan agentOutput) tea.Cmd {

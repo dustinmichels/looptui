@@ -56,7 +56,10 @@ Extra arguments after the document are forwarded to `omp`:
 looptui path/to/migration.md --model opus
 ```
 
+The active model is displayed in the top header (e.g. `LOOP migration.md · opus`) in both runner and review modes. It is detected from `--model` CLI arguments, OMP configuration (`~/.omp/agent/config.yml`), or dynamically updated from `omp` runtime events.
 If no document is passed, `looptui` uses `$DOC`, then `requirements.md` if present, otherwise `migration.md`.
+
+When `looptui` starts, it asks whether to keep the computer awake with macOS `caffeinate`. Answering `yes` starts `caffeinate -d -i -w <looptui-pid>`; it is stopped and reaped when `looptui` exits, including via `q` or `ctrl+c`, and its parent watch also covers abnormal termination.
 
 Show standalone usage without requiring a document or `omp`:
 

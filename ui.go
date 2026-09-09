@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +23,29 @@ type nextRunMsg struct{}
 type editorFinishedMsg struct {
 	err error
 }
+type modelDetectedMsg struct {
+	model string
+}
+
+func detectDefaultModelCmd(ompPath string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, ompPath, "config", "get", "modelRoles")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil
+		}
+		var roles map[string]string
+		if err := json.Unmarshal(out, &roles); err == nil {
+			if def, ok := roles["default"]; ok && def != "" {
+				return modelDetectedMsg{model: def}
+			}
+		}
+		return nil
+	}
+}
+
 
 type uiMode byte
 
@@ -38,6 +63,8 @@ type model struct {
 	height int
 
 	mode uiMode
+	modelName string
+
 
 	current  section
 	run      *agentRun
@@ -96,6 +123,7 @@ func newModel(cfg config) (model, error) {
 		autoRun:   true,
 		status:    "Ready",
 		textInput: ti,
+		modelName: cfg.model,
 	}
 	m.setTerminalState()
 	if doc.pending > 0 {
@@ -105,8 +133,15 @@ func newModel(cfg config) (model, error) {
 }
 
 func (m model) Init() tea.Cmd {
+	var cmds []tea.Cmd
 	if m.starting {
-		return tea.Batch(startAgent(m.cfg, m.current), spinTick())
+		cmds = append(cmds, startAgent(m.cfg, m.current), spinTick())
+	}
+	if m.modelName == "" && m.cfg.ompPath != "" {
+		cmds = append(cmds, detectDefaultModelCmd(m.cfg.ompPath))
+	}
+	if len(cmds) > 0 {
+		return tea.Batch(cmds...)
 	}
 	return nil
 }
@@ -116,6 +151,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, nil
+
+	case modelDetectedMsg:
+		if m.modelName == "" && msg.model != "" {
+			m.modelName = msg.model
+		}
 		return m, nil
 
 	case editorFinishedMsg:
@@ -366,6 +407,15 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.iteration++
 			return m.finishRun(msg.output.exitCode)
 		}
+		if msg.output.kind == outputModel {
+			if msg.output.text != "" {
+				m.modelName = msg.output.text
+			}
+			if m.run != nil {
+				return m, waitForAgent(m.run.events)
+			}
+			return m, nil
+		}
 		if msg.output.kind == outputDelta {
 			m.appendDelta(msg.output.text)
 		} else {
@@ -614,10 +664,52 @@ func openEditor(filePath string, line int) tea.Cmd {
 }
 
 func (m model) headerView(width int) string {
-	left := headerStyle.Render(" LOOP " + filepath.Base(m.cfg.document))
 	right := doneStyle.Render(fmt.Sprintf("%d/%d complete", m.doc.done, m.doc.total))
+	left := m.renderHeaderTitle(" LOOP "+filepath.Base(m.cfg.document), width-lipgloss.Width(right)-1)
 	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
 	return left + strings.Repeat(" ", gap) + right
+}
+
+func (m model) renderHeaderTitle(base string, availWidth int) string {
+	if m.modelName == "" {
+		if len(base) > availWidth && availWidth > 0 {
+			return headerStyle.Render(truncate(base, availWidth))
+		}
+		return headerStyle.Render(base)
+	}
+
+	baseWidth := len(base)
+	dotWidth := 3 // " · "
+	remain := availWidth - baseWidth - dotWidth
+	if remain <= 0 {
+		if len(base) > availWidth && availWidth > 0 {
+			return headerStyle.Render(truncate(base, availWidth))
+		}
+		return headerStyle.Render(base)
+	}
+
+	modelDisp := m.modelName
+	if len(modelDisp) > remain && strings.Contains(modelDisp, "/") {
+		parts := strings.SplitN(modelDisp, "/", 2)
+		if len(parts) == 2 && parts[1] != "" {
+			modelDisp = parts[1]
+		}
+	}
+	if len(modelDisp) > remain {
+		if remain > 4 {
+			modelDisp = truncate(modelDisp, remain)
+		} else {
+			modelDisp = ""
+		}
+	}
+
+	if modelDisp != "" {
+		return headerStyle.Render(base) + mutedStyle.Render(" · ") + activeStyle.Render(modelDisp)
+	}
+	if len(base) > availWidth && availWidth > 0 {
+		return headerStyle.Render(truncate(base, availWidth))
+	}
+	return headerStyle.Render(base)
 }
 
 func (m model) progressView(width, height int) string {
@@ -779,8 +871,8 @@ func (m model) reviewView(width, height int) string {
 }
 
 func (m model) reviewHeaderView(width int, count int) string {
-	left := headerStyle.Render(" LOOP " + filepath.Base(m.cfg.document) + " · Review Mode")
 	right := warnStyle.Render(fmt.Sprintf("%d task(s) need input", count))
+	left := m.renderHeaderTitle(" LOOP "+filepath.Base(m.cfg.document)+" · Review Mode", width-lipgloss.Width(right)-1)
 	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
 	return left + strings.Repeat(" ", gap) + right
 }
