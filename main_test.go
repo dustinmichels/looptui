@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestReadDocumentTracksSectionsAndCheckboxStates(t *testing.T) {
@@ -86,45 +88,335 @@ func TestHelpIsAvailableWithoutDocumentOrOmp(t *testing.T) {
 	}
 }
 
-func TestPromptCaffeinateAcceptsYesAndNo(t *testing.T) {
-	tests := []struct {
-		input string
-		want  bool
-	}{
-		{input: "yes\n", want: true},
-		{input: "Y\n", want: true},
-		{input: "no\n", want: false},
-		{input: "N\n", want: false},
-		{input: "", want: false},
+func TestStartCaffeinateStartsOrSkips(t *testing.T) {
+	cmd, err := startCaffeinate()
+	if err != nil {
+		t.Fatalf("startCaffeinate failed: %v", err)
 	}
-
-	for _, tt := range tests {
-		var output strings.Builder
-		got, err := promptCaffeinate(strings.NewReader(tt.input), &output)
-		if err != nil {
-			t.Fatalf("promptCaffeinate(%q): %v", tt.input, err)
-		}
-		if got != tt.want {
-			t.Errorf("promptCaffeinate(%q) = %v, want %v", tt.input, got, tt.want)
-		}
-		if output.String() != "Keep computer alive with caffeinate? [yes/no] " {
-			t.Errorf("unexpected prompt: %q", output.String())
+	if cmd != nil {
+		stopCaffeinate(cmd)
+		if cmd.ProcessState == nil {
+			t.Fatal("caffeinate process was not stopped and reaped")
 		}
 	}
 }
 
-func TestPromptCaffeinateRepeatsForInvalidAnswer(t *testing.T) {
-	var output strings.Builder
-	got, err := promptCaffeinate(strings.NewReader("maybe\nyes\n"), &output)
-	if err != nil {
+func TestFindChecklistDocumentsRecursionAndCompleteness(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Root plan with 3 tasks (1 done, 1 blocked, 1 pending)
+	rootPlan := filepath.Join(dir, "root-plan.md")
+	if err := os.WriteFile(rootPlan, []byte("## Section 1\n- [x] done\n- [!] blocked\n- [ ] pending\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !got {
-		t.Fatal("valid answer after retry was not accepted")
+
+	// 2. Nested plan in sub directory (2 tasks, both done)
+	subDir := filepath.Join(dir, "sub", "tasks")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
 	}
-	want := "Keep computer alive with caffeinate? [yes/no] Please answer yes or no.\nKeep computer alive with caffeinate? [yes/no] "
-	if output.String() != want {
-		t.Fatalf("unexpected prompt output: %q", output.String())
+	subPlan := filepath.Join(subDir, "nested.md")
+	if err := os.WriteFile(subPlan, []byte("## All Done\n- [x] first\n- [x] second\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Markdown file with no checkboxes (should be skipped)
+	noChecklist := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(noChecklist, []byte("# Hello\nJust some docs.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Checklist in .git directory (should be skipped)
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "ignored.md"), []byte("- [ ] task\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Checklist in node_modules directory (should be skipped)
+	nodeDir := filepath.Join(dir, "node_modules", "pkg")
+	if err := os.MkdirAll(nodeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeDir, "pkg-todo.md"), []byte("- [ ] task\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := findChecklistDocuments(dir)
+	if err != nil {
+		t.Fatalf("findChecklistDocuments: %v", err)
+	}
+
+	if len(docs) != 2 {
+		t.Fatalf("expected 2 documents, got %d: %+v", len(docs), docs)
+	}
+
+	// Incomplete documents sorted before complete ones, tie-broken by relative path
+	if docs[0].path != "root-plan.md" {
+		t.Errorf("expected docs[0].path to be root-plan.md, got %q", docs[0].path)
+	}
+	if docs[0].doc.total != 3 || docs[0].doc.done != 1 || docs[0].doc.blocked != 1 || docs[0].doc.pending != 1 {
+		t.Errorf("unexpected counts for root-plan.md: %+v", docs[0].doc)
+	}
+	comp0 := docs[0].completenessString()
+	if !strings.Contains(comp0, "33%") || !strings.Contains(comp0, "1/3 completed") || !strings.Contains(comp0, "1 done, 1 pending, 1 blocked") {
+		t.Errorf("unexpected completeness string: %q", comp0)
+	}
+
+	expectedSubPath := filepath.Join("sub", "tasks", "nested.md")
+	if docs[1].path != expectedSubPath {
+		t.Errorf("expected docs[1].path to be %q, got %q", expectedSubPath, docs[1].path)
+	}
+	if docs[1].doc.total != 2 || docs[1].doc.done != 2 {
+		t.Errorf("unexpected counts for nested.md: %+v", docs[1].doc)
+	}
+	comp1 := docs[1].completenessString()
+	if !strings.Contains(comp1, "100%") || !strings.Contains(comp1, "2/2 completed") {
+		t.Errorf("unexpected completeness string: %q", comp1)
+	}
+}
+
+func TestFindChecklistDocumentsSortsIncompleteBeforeComplete(t *testing.T) {
+	dir := t.TempDir()
+
+	files := map[string]string{
+		"a_finished.md":      "## Done\n- [x] task 1\n- [x] task 2\n",
+		"b_pending.md":       "## Tasks\n- [ ] task 1\n",
+		"c_blocked.md":       "## Blocked\n- [!] need feedback\n",
+		"d_half_done.md":     "## Half\n- [x] task 1\n- [ ] task 2\n",
+		"e_also_finished.md": "## Finished\n- [x] single task\n",
+	}
+
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	docs, err := findChecklistDocuments(dir)
+	if err != nil {
+		t.Fatalf("findChecklistDocuments: %v", err)
+	}
+
+	if len(docs) != len(files) {
+		t.Fatalf("expected %d documents, got %d", len(files), len(docs))
+	}
+
+	// Incomplete files up top (alphabetical), complete files (100%) at bottom (alphabetical)
+	wantPaths := []string{
+		"b_pending.md",
+		"c_blocked.md",
+		"d_half_done.md",
+		"a_finished.md",
+		"e_also_finished.md",
+	}
+
+	for i, want := range wantPaths {
+		if docs[i].path != want {
+			t.Errorf("docs[%d].path = %q, want %q", i, docs[i].path, want)
+		}
+	}
+
+	// Verify completeness flags
+	for i, doc := range docs[:3] {
+		if doc.isComplete() {
+			t.Errorf("expected docs[%d] (%s) to be incomplete", i, doc.path)
+		}
+	}
+	for i, doc := range docs[3:] {
+		if !doc.isComplete() {
+			t.Errorf("expected docs[%d] (%s) to be complete", i+3, doc.path)
+		}
+	}
+}
+
+func TestLoadConfigOmitsDocumentWhenNotSupplied(t *testing.T) {
+	// Clear DOC env
+	oldDoc := os.Getenv("DOC")
+	defer os.Setenv("DOC", oldDoc)
+	os.Unsetenv("DOC")
+
+	cfg, err := loadConfig([]string{"--model", "opus"})
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	if cfg.document != "" {
+		t.Errorf("expected empty cfg.document, got %q", cfg.document)
+	}
+	if cfg.model != "opus" {
+		t.Errorf("expected model opus, got %q", cfg.model)
+	}
+}
+
+func TestSelectModelNavigationAndSelection(t *testing.T) {
+	dir := t.TempDir()
+	p1 := filepath.Join(dir, "p1.md")
+	p2 := filepath.Join(dir, "p2.md")
+	if err := os.WriteFile(p1, []byte("## S1\n- [ ] task 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p2, []byte("## S2\n- [x] task 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := findChecklistDocuments(dir)
+	if err != nil || len(docs) != 2 {
+		t.Fatalf("failed to find docs: %v, len=%d", err, len(docs))
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+
+	if m.mode != modeSelect {
+		t.Fatalf("expected modeSelect, got %v", m.mode)
+	}
+	if m.selectedDocIdx != 0 {
+		t.Fatalf("expected selectedDocIdx 0, got %d", m.selectedDocIdx)
+	}
+
+	// Down key moves to index 1
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx 1 after down/j, got %d", m.selectedDocIdx)
+	}
+
+	// Up key moves back to index 0
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 0 {
+		t.Fatalf("expected selectedDocIdx 0 after up/k, got %d", m.selectedDocIdx)
+	}
+
+	// '2' key jumps to index 1
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx 1 after '2', got %d", m.selectedDocIdx)
+	}
+
+	// Enter selects p2.md and transitions to modeRunner
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeRunner {
+		t.Fatalf("expected modeRunner after enter, got %v", m.mode)
+	}
+	if m.cfg.document != docs[1].absPath {
+		t.Fatalf("expected cfg.document %q, got %q", docs[1].absPath, m.cfg.document)
+	}
+}
+
+func TestSelectModelEditorRefreshPreservesSelectedDocumentAcrossReorder(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	aDoc := filepath.Join(dir, "a_doc.md")
+	bDoc := filepath.Join(dir, "b_doc.md")
+	zDoc := filepath.Join(dir, "z_done.md")
+
+	if err := os.WriteFile(aDoc, []byte("## S1\n- [ ] task a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bDoc, []byte("## S2\n- [ ] task b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zDoc, []byte("## S3\n- [x] task z\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := findChecklistDocuments(".")
+	if err != nil || len(docs) != 3 {
+		t.Fatalf("findChecklistDocuments: %v, len=%d", err, len(docs))
+	}
+
+	// Initially: a_doc (incomplete, idx 0), b_doc (incomplete, idx 1), z_done (complete, idx 2)
+	if docs[0].path != "a_doc.md" || docs[1].path != "b_doc.md" || docs[2].path != "z_done.md" {
+		t.Fatalf("unexpected initial order: %+v", docs)
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+
+	// Currently selecting a_doc.md at idx 0
+	if m.selectedDocIdx != 0 {
+		t.Fatalf("expected selectedDocIdx 0, got %d", m.selectedDocIdx)
+	}
+
+	// Simulate editing a_doc.md so that it becomes 100% complete
+	if err := os.WriteFile(aDoc, []byte("## S1\n- [x] task a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// editorFinishedMsg triggers refresh
+	newM, _ := m.Update(editorFinishedMsg{})
+	m = newM.(model)
+
+	// In the refreshed list:
+	// b_doc.md (incomplete) is at index 0
+	// a_doc.md (complete) is at index 1
+	// z_done.md (complete) is at index 2
+	if m.discoveredDocs[0].path != "b_doc.md" {
+		t.Fatalf("expected discoveredDocs[0] to be b_doc.md, got %q", m.discoveredDocs[0].path)
+	}
+	if m.discoveredDocs[1].path != "a_doc.md" {
+		t.Fatalf("expected discoveredDocs[1] to be a_doc.md, got %q", m.discoveredDocs[1].path)
+	}
+
+	// selectedDocIdx should have tracked a_doc.md to index 1
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx to relocate to 1 for a_doc.md, got %d", m.selectedDocIdx)
+	}
+
+	// Pressing Enter should now open a_doc.md
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeRunner {
+		t.Fatalf("expected modeRunner, got %v", m.mode)
+	}
+	if m.cfg.document != docs[0].absPath {
+		t.Fatalf("expected cfg.document %q, got %q", docs[0].absPath, m.cfg.document)
+	}
+}
+
+func TestSelectModelQuitsOnQ(t *testing.T) {
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, []checklistDoc{{path: "test.md", absPath: "/tmp/test.md"}})
+
+	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = newM.(model)
+	if m.exitCode != 0 {
+		t.Fatalf("expected exitCode 0, got %d", m.exitCode)
+	}
+	if cmd == nil {
+		t.Fatal("expected quit cmd, got nil")
+	}
+}
+
+func TestSelectViewRendersRelativePathsAndCompleteness(t *testing.T) {
+	doc1 := document{total: 10, done: 5, pending: 4, blocked: 1}
+	doc2 := document{total: 5, done: 5}
+	docs := []checklistDoc{
+		{path: "docs/plan.md", absPath: "/tmp/docs/plan.md", doc: doc1},
+		{path: "root-tasks.md", absPath: "/tmp/root-tasks.md", doc: doc2},
+	}
+	m := newSelectModel(config{document: ""}, docs)
+	m.width = 100
+	m.height = 30
+
+	view := m.View()
+	if !strings.Contains(view, "docs/plan.md") {
+		t.Errorf("view does not contain relative path docs/plan.md:\n%s", view)
+	}
+	if !strings.Contains(view, "root-tasks.md") {
+		t.Errorf("view does not contain relative path root-tasks.md:\n%s", view)
+	}
+	if !strings.Contains(view, "50%") || !strings.Contains(view, "5/10 completed") {
+		t.Errorf("view does not contain completeness for docs/plan.md:\n%s", view)
+	}
+	if !strings.Contains(view, "100%") || !strings.Contains(view, "5/5 completed") {
+		t.Errorf("view does not contain completeness for root-tasks.md:\n%s", view)
 	}
 }
 

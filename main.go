@@ -38,7 +38,7 @@ Document format:
   - [x] completed task
   - [!] blocked task (skipped during run; saved for user input)
 
-If document is omitted, looptui uses $DOC, then requirements.md if present, otherwise migration.md.
+If document is omitted, looptui scans the current directory and subdirectories for markdown files with checklists and presents an interactive selection list.
 
 Controls:
   space        pause / resume automatic runs
@@ -75,24 +75,32 @@ func run(args []string, input io.Reader, output io.Writer) int {
 		return 1
 	}
 
-	app, err := newModel(cfg)
+	caffeinate, err := startCaffeinate()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "looptui:", err)
-		return 1
+		fmt.Fprintln(os.Stderr, "looptui: caffeinate:", err)
+	} else if caffeinate != nil {
+		defer stopCaffeinate(caffeinate)
 	}
 
-	keepAwake, err := promptCaffeinate(input, output)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "looptui:", err)
-		return 1
-	}
-	if keepAwake {
-		caffeinate, err := startCaffeinate()
+	var app tea.Model
+	if cfg.document == "" {
+		checklistDocs, err := findChecklistDocuments(".")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "looptui:", err)
 			return 1
 		}
-		defer stopCaffeinate(caffeinate)
+		if len(checklistDocs) == 0 {
+			fmt.Fprintln(os.Stderr, "looptui: no markdown files with checklists found in current directory or subdirectories")
+			return 1
+		}
+		app = newSelectModel(cfg, checklistDocs)
+	} else {
+		m, err := newModel(cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "looptui:", err)
+			return 1
+		}
+		app = m
 	}
 
 	program := tea.NewProgram(app, tea.WithAltScreen())
@@ -107,31 +115,10 @@ func run(args []string, input io.Reader, output io.Writer) int {
 	return 0
 }
 
-func promptCaffeinate(input io.Reader, output io.Writer) (bool, error) {
-	reader := bufio.NewReader(input)
-	for {
-		fmt.Fprint(output, "Keep computer alive with caffeinate? [yes/no] ")
-		answer, err := reader.ReadString('\n')
-		switch strings.ToLower(strings.TrimSpace(answer)) {
-		case "yes", "y":
-			return true, nil
-		case "no", "n":
-			return false, nil
-		}
-		if errors.Is(err, io.EOF) {
-			return false, nil
-		}
-		if err != nil {
-			return false, fmt.Errorf("read caffeinate choice: %w", err)
-		}
-		fmt.Fprintln(output, "Please answer yes or no.")
-	}
-}
-
 func startCaffeinate() (*exec.Cmd, error) {
 	path, err := exec.LookPath("caffeinate")
 	if err != nil {
-		return nil, fmt.Errorf("'caffeinate' command not found in PATH")
+		return nil, nil
 	}
 	cmd := exec.Command(path, "-d", "-i", "-w", strconv.Itoa(os.Getpid()))
 	if err := cmd.Start(); err != nil {
@@ -198,29 +185,24 @@ func loadConfig(args []string) (config, error) {
 		cfg.document = os.Getenv("DOC")
 		cfg.extraArgs = append([]string(nil), args...)
 	}
-	if cfg.document == "" {
-		if fileExists("requirements.md") {
-			cfg.document = "requirements.md"
-		} else {
-			cfg.document = "migration.md"
+	if cfg.document != "" {
+		absolute, err := filepath.Abs(cfg.document)
+		if err != nil {
+			return cfg, fmt.Errorf("resolve document: %w", err)
 		}
+		if !fileExists(absolute) {
+			return cfg, fmt.Errorf("document %q not found", cfg.document)
+		}
+		cfg.document = absolute
 	}
-
-	absolute, err := filepath.Abs(cfg.document)
-	if err != nil {
-		return cfg, fmt.Errorf("resolve document: %w", err)
-	}
-	if !fileExists(absolute) {
-		return cfg, fmt.Errorf("document %q not found", cfg.document)
-	}
-	cfg.document = absolute
 
 	cfg.ompPath = os.Getenv("OMP_BIN")
 	if cfg.ompPath == "" {
-		cfg.ompPath, err = exec.LookPath("omp")
+		path, err := exec.LookPath("omp")
 		if err != nil {
 			return cfg, errors.New("'omp' command not found in PATH")
 		}
+		cfg.ompPath = path
 	}
 
 	cfg.model = parseModelFromArgs(cfg.extraArgs)

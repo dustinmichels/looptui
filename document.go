@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -65,6 +67,10 @@ type document struct {
 	pending  int
 	blocked  int
 }
+func (d document) isComplete() bool {
+	return d.total > 0 && d.done == d.total
+}
+
 
 func readDocument(path string) (document, error) {
 	file, err := os.Open(path)
@@ -75,10 +81,19 @@ func readDocument(path string) (document, error) {
 
 	var doc document
 	current := -1
+	inCodeBlock := false
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for lineNumber := 1; scanner.Scan(); lineNumber++ {
 		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+		if inCodeBlock {
+			continue
+		}
 		if strings.HasPrefix(line, "## ") {
 			doc.sections = append(doc.sections, section{
 				title: strings.TrimSpace(strings.TrimPrefix(line, "## ")),
@@ -233,4 +248,99 @@ func updateTaskInFile(filePath string, task taskItem, newState taskState, userNo
 	newContent := strings.Join(lines, "\n")
 
 	return os.WriteFile(filePath, []byte(newContent), 0o644)
+}
+
+type checklistDoc struct {
+	path    string
+	absPath string
+	doc     document
+}
+func (c checklistDoc) isComplete() bool {
+	return c.doc.isComplete()
+}
+
+
+func (c checklistDoc) completenessString() string {
+	pct := 0
+	if c.doc.total > 0 {
+		pct = (c.doc.done * 100) / c.doc.total
+	}
+	var parts []string
+	if c.doc.done > 0 {
+		parts = append(parts, fmt.Sprintf("%d done", c.doc.done))
+	}
+	if c.doc.pending > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending", c.doc.pending))
+	}
+	if c.doc.blocked > 0 {
+		parts = append(parts, fmt.Sprintf("%d blocked", c.doc.blocked))
+	}
+	details := strings.Join(parts, ", ")
+	if details != "" {
+		return fmt.Sprintf("[%3d%%] %d/%d completed (%s)", pct, c.doc.done, c.doc.total, details)
+	}
+	return fmt.Sprintf("[%3d%%] %d/%d completed", pct, c.doc.done, c.doc.total)
+}
+
+func findChecklistDocuments(rootDir string) ([]checklistDoc, error) {
+	if rootDir == "" {
+		rootDir = "."
+	}
+	var results []checklistDoc
+	err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != rootDir && (strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "dist" || name == "build") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if strings.HasPrefix(d.Name(), ".") || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+
+		doc, err := readDocument(path)
+		if err != nil {
+			return nil
+		}
+		if doc.total == 0 {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(rootDir, path)
+		if err != nil {
+			relPath = path
+		}
+		relPath = filepath.Clean(relPath)
+
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			absPath = path
+		}
+
+		results = append(results, checklistDoc{
+			path:    relPath,
+			absPath: absPath,
+			doc:     doc,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan markdown files: %w", err)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		iComplete := results[i].isComplete()
+		jComplete := results[j].isComplete()
+		if iComplete != jComplete {
+			return !iComplete
+		}
+		return results[i].path < results[j].path
+	})
+
+	return results, nil
 }

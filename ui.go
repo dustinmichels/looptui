@@ -53,6 +53,7 @@ const (
 	modeRunner uiMode = iota
 	modeReview
 	modeInput
+	modeSelect
 )
 
 type model struct {
@@ -62,9 +63,11 @@ type model struct {
 	width  int
 	height int
 
-	mode uiMode
+	mode      uiMode
 	modelName string
 
+	discoveredDocs []checklistDoc
+	selectedDocIdx int
 
 	current  section
 	run      *agentRun
@@ -132,8 +135,36 @@ func newModel(cfg config) (model, error) {
 	return m, nil
 }
 
+func newSelectModel(cfg config, docs []checklistDoc) model {
+	ti := textinput.New()
+	ti.Placeholder = "Type answer / response for the agent and press Enter..."
+	ti.CharLimit = 1000
+
+	return model{
+		cfg:            cfg,
+		width:          100,
+		height:         30,
+		autoRun:        true,
+		status:         "Select a document to run",
+		textInput:      ti,
+		modelName:      cfg.model,
+		mode:           modeSelect,
+		discoveredDocs: docs,
+		selectedDocIdx: 0,
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
+	if m.mode == modeSelect {
+		if m.modelName == "" && m.cfg.ompPath != "" {
+			cmds = append(cmds, detectDefaultModelCmd(m.cfg.ompPath))
+		}
+		if len(cmds) > 0 {
+			return tea.Batch(cmds...)
+		}
+		return nil
+	}
 	if m.starting {
 		cmds = append(cmds, startAgent(m.cfg, m.current), spinTick())
 	}
@@ -160,6 +191,34 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case editorFinishedMsg:
+		if m.mode == modeSelect {
+			var selectedAbsPath string
+			if m.selectedDocIdx >= 0 && m.selectedDocIdx < len(m.discoveredDocs) {
+				selectedAbsPath = m.discoveredDocs[m.selectedDocIdx].absPath
+			}
+			if docs, err := findChecklistDocuments("."); err == nil && len(docs) > 0 {
+				m.discoveredDocs = docs
+				found := false
+				if selectedAbsPath != "" {
+					for i, d := range m.discoveredDocs {
+						if d.absPath == selectedAbsPath {
+							m.selectedDocIdx = i
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					if m.selectedDocIdx >= len(m.discoveredDocs) {
+						m.selectedDocIdx = len(m.discoveredDocs) - 1
+					}
+					if m.selectedDocIdx < 0 {
+						m.selectedDocIdx = 0
+					}
+				}
+			}
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status = "Editor error: " + msg.err.Error()
 		}
@@ -172,8 +231,74 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setTerminalState()
 		return m, nil
-
 	case tea.KeyMsg:
+		if m.mode == modeSelect {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				m.exitCode = 0
+				return m, tea.Quit
+			case "up", "k":
+				if m.selectedDocIdx > 0 {
+					m.selectedDocIdx--
+				}
+				return m, nil
+			case "down", "j":
+				if m.selectedDocIdx < len(m.discoveredDocs)-1 {
+					m.selectedDocIdx++
+				}
+				return m, nil
+			case "home", "g":
+				m.selectedDocIdx = 0
+				return m, nil
+			case "end", "G":
+				if len(m.discoveredDocs) > 0 {
+					m.selectedDocIdx = len(m.discoveredDocs) - 1
+				}
+				return m, nil
+			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+				idx := int(msg.String()[0] - '1')
+				if idx < len(m.discoveredDocs) {
+					m.selectedDocIdx = idx
+				}
+				return m, nil
+			case "e":
+				if len(m.discoveredDocs) > 0 && m.selectedDocIdx >= 0 && m.selectedDocIdx < len(m.discoveredDocs) {
+					selected := m.discoveredDocs[m.selectedDocIdx]
+					return m, openEditor(selected.absPath, 0)
+				}
+				return m, nil
+			case "enter":
+				if len(m.discoveredDocs) == 0 {
+					return m, nil
+				}
+				selected := m.discoveredDocs[m.selectedDocIdx]
+				doc, err := readDocument(selected.absPath)
+				if err != nil {
+					m.status = fmt.Sprintf("Error reading %s: %v", selected.path, err)
+					return m, nil
+				}
+				m.cfg.document = selected.absPath
+				m.doc = doc
+				m.mode = modeRunner
+				m.setTerminalState()
+				if m.doc.pending > 0 {
+					m.prepareRun()
+				}
+				var cmds []tea.Cmd
+				if m.starting {
+					cmds = append(cmds, startAgent(m.cfg, m.current), spinTick())
+				}
+				if m.modelName == "" && m.cfg.ompPath != "" {
+					cmds = append(cmds, detectDefaultModelCmd(m.cfg.ompPath))
+				}
+				if len(cmds) > 0 {
+					return m, tea.Batch(cmds...)
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+
 		if m.mode == modeInput {
 			switch msg.String() {
 			case "enter":
@@ -458,6 +583,10 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	width := max(60, m.width)
 	height := max(16, m.height)
+
+	if m.mode == modeSelect {
+		return m.selectView(width, height)
+	}
 
 	if m.mode == modeReview || m.mode == modeInput {
 		return m.reviewView(width, height)
@@ -976,4 +1105,136 @@ func truncate(value string, width int) string {
 		return "…"
 	}
 	return string(runes[:width-1]) + "…"
+}
+
+func (m model) selectView(width, height int) string {
+	header := m.selectHeaderView(width)
+	footer := m.selectFooter(width)
+	bodyHeight := max(6, height-2)
+
+	content := m.selectList(max(1, width-4), max(1, bodyHeight-2))
+
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(panelEdge).
+		Width(max(1, width-2)).
+		Height(max(1, bodyHeight-2)).
+		Render(content)
+
+	return header + "\n" + panel + "\n" + footer
+}
+
+func (m model) selectHeaderView(width int) string {
+	count := len(m.discoveredDocs)
+	docWord := "documents"
+	if count == 1 {
+		docWord = "document"
+	}
+	right := mutedStyle.Render(fmt.Sprintf("%d %s with checklists", count, docWord))
+	left := m.renderHeaderTitle(" LOOP · Select Document", width-lipgloss.Width(right)-1)
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func (m model) selectFooter(width int) string {
+	controls := mutedStyle.Render("↑/↓ or j/k navigate · 1-9 jump · enter select · e edit · q quit")
+	status := truncate(m.status, max(1, width-lipgloss.Width(controls)-1))
+	gap := max(1, width-lipgloss.Width(status)-lipgloss.Width(controls))
+	return status + strings.Repeat(" ", gap) + controls
+}
+
+func (m model) selectList(width, height int) string {
+	var b strings.Builder
+	b.WriteString(headerStyle.Render("Discovered Markdown Documents with Checklists"))
+	b.WriteString("\n\n")
+
+	if len(m.discoveredDocs) == 0 {
+		b.WriteString(mutedStyle.Render("No markdown files with checklists found in current directory."))
+		return b.String()
+	}
+
+	visibleHeight := max(1, height-4)
+	start := 0
+	if m.selectedDocIdx >= visibleHeight {
+		start = m.selectedDocIdx - visibleHeight + 1
+	}
+	end := min(len(m.discoveredDocs), start+visibleHeight)
+
+	if start > 0 {
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more above", start)))
+		b.WriteByte('\n')
+	}
+
+	for idx := start; idx < end; idx++ {
+		doc := m.discoveredDocs[idx]
+		isSelected := idx == m.selectedDocIdx
+
+		sel := "  "
+		itemStyle := lipgloss.NewStyle()
+		if isSelected {
+			sel = "> "
+			itemStyle = activeStyle
+		}
+
+		pct := 0
+		if doc.doc.total > 0 {
+			pct = (doc.doc.done * 100) / doc.doc.total
+		}
+
+		var pctBadge string
+		if pct == 100 {
+			pctBadge = doneStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+		} else if doc.doc.blocked > 0 && doc.doc.pending == 0 {
+			pctBadge = warnStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+		} else {
+			pctBadge = activeStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+		}
+
+		var detailParts []string
+		if doc.doc.done > 0 {
+			detailParts = append(detailParts, doneStyle.Render(fmt.Sprintf("%d done", doc.doc.done)))
+		}
+		if doc.doc.pending > 0 {
+			detailParts = append(detailParts, fmt.Sprintf("%d pending", doc.doc.pending))
+		}
+		if doc.doc.blocked > 0 {
+			detailParts = append(detailParts, warnStyle.Render(fmt.Sprintf("%d blocked", doc.doc.blocked)))
+		}
+		details := strings.Join(detailParts, ", ")
+		if details != "" {
+			details = " (" + details + ")"
+		}
+
+		compText := fmt.Sprintf("%s %d/%d completed%s", pctBadge, doc.doc.done, doc.doc.total, details)
+		numPrefix := fmt.Sprintf("%s%2d. ", sel, idx+1)
+
+		compWidth := lipgloss.Width(compText)
+		if width-compWidth-len(numPrefix)-1 < 15 && details != "" {
+			// Drop detailed parenthetical if space is constrained
+			compText = fmt.Sprintf("%s %d/%d completed", pctBadge, doc.doc.done, doc.doc.total)
+			compWidth = lipgloss.Width(compText)
+		}
+
+		availPath := max(10, width-compWidth-len(numPrefix)-1)
+		displayPath := doc.path
+		if lipgloss.Width(displayPath) > availPath {
+			displayPath = truncate(displayPath, availPath)
+		}
+
+		pathText := itemStyle.Render(numPrefix + displayPath)
+		pathWidth := lipgloss.Width(pathText)
+
+		gapLen := max(1, width-pathWidth-compWidth)
+		b.WriteString(pathText)
+		b.WriteString(strings.Repeat(" ", gapLen))
+		b.WriteString(compText)
+		b.WriteByte('\n')
+	}
+
+	if end < len(m.discoveredDocs) {
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more below", len(m.discoveredDocs)-end)))
+		b.WriteByte('\n')
+	}
+
+	return strings.TrimSuffix(b.String(), "\n")
 }

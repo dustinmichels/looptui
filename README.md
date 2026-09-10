@@ -57,10 +57,9 @@ looptui path/to/migration.md --model opus
 ```
 
 The active model is displayed in the top header (e.g. `LOOP migration.md · opus`) in both runner and review modes. It is detected from `--model` CLI arguments, OMP configuration (`~/.omp/agent/config.yml`), or dynamically updated from `omp` runtime events.
-If no document is passed, `looptui` uses `$DOC`, then `requirements.md` if present, otherwise `migration.md`.
+If no document is passed, `looptui` uses `$DOC` if set; otherwise it automatically scans the current directory and subdirectories for markdown files with checklists and presents an interactive selection list noting the relative path and completion status for each file, sorting incomplete files up top and complete ones (100%) at the bottom.
 
-When `looptui` starts, it asks whether to keep the computer awake with macOS `caffeinate`. Answering `yes` starts `caffeinate -d -i -w <looptui-pid>`; it is stopped and reaped when `looptui` exits, including via `q` or `ctrl+c`, and its parent watch also covers abnormal termination.
-
+`looptui` automatically runs macOS `caffeinate` (`caffeinate -d -i -w <looptui-pid>`) in the background along with the TUI without prompting, keeping your computer awake while the loop is active. It is stopped and reaped when `looptui` exits, including via `q` or `ctrl+c`.
 Show standalone usage without requiring a document or `omp`:
 
 ```sh
@@ -68,6 +67,16 @@ looptui --help
 ```
 
 ## Runtime controls
+### Document selection mode
+
+When no document is specified, `looptui` lists all discovered markdown files that contain checklists:
+
+- `j`/`k` or `down`/`up`: navigate between documents.
+- `1`–`9`: jump directly to a document number.
+- `enter`: select the document and start running.
+- `e`: open the selected document in `$EDITOR`.
+- `q` or `ctrl+c`: quit.
+
 
 ### Runner mode
 
