@@ -68,7 +68,7 @@ type model struct {
 
 	discoveredDocs []checklistDoc
 	selectedDocIdx int
-
+	selectScroll   int
 	current  section
 	run      *agentRun
 	starting bool
@@ -135,22 +135,147 @@ func newModel(cfg config) (model, error) {
 	return m, nil
 }
 
+func (m model) numSelectableDocs() int {
+	count := 0
+	for _, d := range m.discoveredDocs {
+		if !d.isComplete() {
+			count++
+		}
+	}
+	return count
+}
+
+func (m model) totalSelectRows() int {
+	n := len(m.discoveredDocs)
+	numSelectable := m.numSelectableDocs()
+	if numSelectable > 0 && numSelectable < n {
+		return n + 1
+	}
+	return n
+}
+
+func (m model) selectRowAt(r int) (checklistDoc, int, bool) {
+	numSelectable := m.numSelectableDocs()
+	hasDivider := numSelectable > 0 && numSelectable < len(m.discoveredDocs)
+	if hasDivider {
+		if r < numSelectable {
+			return m.discoveredDocs[r], r, false
+		}
+		if r == numSelectable {
+			return checklistDoc{}, -1, true
+		}
+		return m.discoveredDocs[r-1], r - 1, false
+	}
+	return m.discoveredDocs[r], r, false
+}
+
+func (m model) selectVisibleHeight() int {
+	bodyHeight := max(6, m.height-2)
+	listHeight := max(1, bodyHeight-2)
+	return max(1, listHeight-4)
+}
+
+func (m model) selectMaxScroll() int {
+	totalRows := m.totalSelectRows()
+	visibleHeight := m.selectVisibleHeight()
+	if totalRows <= visibleHeight {
+		return 0
+	}
+	capacity := max(1, visibleHeight-1)
+	return max(0, totalRows-capacity)
+}
+
+func (m model) clampSelectScroll() int {
+	maxScroll := m.selectMaxScroll()
+	if m.selectScroll > maxScroll {
+		return maxScroll
+	}
+	if m.selectScroll < 0 {
+		return 0
+	}
+	return m.selectScroll
+}
+
+func (m *model) setClampedSelectScroll() {
+	m.selectScroll = m.clampSelectScroll()
+}
+
+func (m model) selectVisibleRange() (int, int) {
+	visibleHeight := m.selectVisibleHeight()
+	totalRows := m.totalSelectRows()
+	scroll := m.clampSelectScroll()
+
+	start := scroll
+	availRows := visibleHeight
+	if start > 0 {
+		availRows--
+	}
+	if start+availRows < totalRows {
+		availRows--
+	}
+	availRows = max(1, availRows)
+	end := min(totalRows, start+availRows)
+	return start, end
+}
+
+func (m *model) revealSelectedDoc() {
+	if m.selectedDocIdx < 0 {
+		m.setClampedSelectScroll()
+		return
+	}
+	cursorRow := m.selectedDocIdx
+	for cursorRow < m.selectScroll && m.selectScroll > 0 {
+		m.selectScroll--
+	}
+	maxScroll := m.selectMaxScroll()
+	for {
+		start, end := m.selectVisibleRange()
+		if (cursorRow >= start && cursorRow < end) || m.selectScroll >= maxScroll {
+			break
+		}
+		m.selectScroll++
+	}
+	m.setClampedSelectScroll()
+}
+
+func (m model) isSelectedDocVisible() bool {
+	if m.selectedDocIdx < 0 {
+		return false
+	}
+	start, end := m.selectVisibleRange()
+	cursorRow := m.selectedDocIdx
+	return cursorRow >= start && cursorRow < end
+}
+
 func newSelectModel(cfg config, docs []checklistDoc) model {
 	ti := textinput.New()
 	ti.Placeholder = "Type answer / response for the agent and press Enter..."
 	ti.CharLimit = 1000
+
+	initialIdx := -1
+	for i, d := range docs {
+		if !d.isComplete() {
+			initialIdx = i
+			break
+		}
+	}
+
+	status := "Select a document to run"
+	if initialIdx == -1 && len(docs) > 0 {
+		status = "All documents are complete"
+	}
 
 	return model{
 		cfg:            cfg,
 		width:          100,
 		height:         30,
 		autoRun:        true,
-		status:         "Select a document to run",
+		status:         status,
 		textInput:      ti,
 		modelName:      cfg.model,
 		mode:           modeSelect,
 		discoveredDocs: docs,
-		selectedDocIdx: 0,
+		selectedDocIdx: initialIdx,
 	}
 }
 
@@ -182,6 +307,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.mode == modeSelect {
+			m.setClampedSelectScroll()
+		}
 		return m, nil
 
 	case modelDetectedMsg:
@@ -198,10 +326,11 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if docs, err := findChecklistDocuments("."); err == nil && len(docs) > 0 {
 				m.discoveredDocs = docs
+				selectableCount := m.numSelectableDocs()
 				found := false
 				if selectedAbsPath != "" {
-					for i, d := range m.discoveredDocs {
-						if d.absPath == selectedAbsPath {
+					for i := range selectableCount {
+						if m.discoveredDocs[i].absPath == selectedAbsPath {
 							m.selectedDocIdx = i
 							found = true
 							break
@@ -209,13 +338,22 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if !found {
-					if m.selectedDocIdx >= len(m.discoveredDocs) {
-						m.selectedDocIdx = len(m.discoveredDocs) - 1
-					}
-					if m.selectedDocIdx < 0 {
-						m.selectedDocIdx = 0
+					if selectableCount > 0 {
+						if m.selectedDocIdx >= selectableCount {
+							m.selectedDocIdx = selectableCount - 1
+						}
+						if m.selectedDocIdx < 0 {
+							m.selectedDocIdx = 0
+						}
+						if m.status == "All documents are complete" {
+							m.status = "Select a document to run"
+						}
+					} else {
+						m.selectedDocIdx = -1
+						m.status = "All documents are complete"
 					}
 				}
+				m.revealSelectedDoc()
 			}
 			return m, nil
 		}
@@ -233,42 +371,63 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if m.mode == modeSelect {
+			selectableCount := m.numSelectableDocs()
+			visibleHeight := m.selectVisibleHeight()
+			maxScroll := m.selectMaxScroll()
+
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.exitCode = 0
 				return m, tea.Quit
 			case "up", "k":
-				if m.selectedDocIdx > 0 {
+				if m.selectScroll > 0 && (selectableCount == 0 || m.selectScroll > m.selectedDocIdx) {
+					m.selectScroll--
+				} else if m.selectedDocIdx > 0 {
 					m.selectedDocIdx--
+					m.revealSelectedDoc()
 				}
 				return m, nil
 			case "down", "j":
-				if m.selectedDocIdx < len(m.discoveredDocs)-1 {
+				if selectableCount > 0 && m.selectedDocIdx < selectableCount-1 {
 					m.selectedDocIdx++
+					m.revealSelectedDoc()
+				} else if m.selectScroll < maxScroll {
+					m.selectScroll++
 				}
+				return m, nil
+			case "pgdown", "ctrl+d":
+				m.selectScroll = min(maxScroll, m.selectScroll+visibleHeight)
+				return m, nil
+			case "pgup", "ctrl+u":
+				m.selectScroll = max(0, m.selectScroll-visibleHeight)
 				return m, nil
 			case "home", "g":
-				m.selectedDocIdx = 0
+				if selectableCount > 0 {
+					m.selectedDocIdx = 0
+				}
+				m.selectScroll = 0
 				return m, nil
 			case "end", "G":
-				if len(m.discoveredDocs) > 0 {
-					m.selectedDocIdx = len(m.discoveredDocs) - 1
+				if selectableCount > 0 {
+					m.selectedDocIdx = selectableCount - 1
 				}
+				m.selectScroll = maxScroll
 				return m, nil
 			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 				idx := int(msg.String()[0] - '1')
-				if idx < len(m.discoveredDocs) {
+				if idx < selectableCount {
 					m.selectedDocIdx = idx
+					m.revealSelectedDoc()
 				}
 				return m, nil
 			case "e":
-				if len(m.discoveredDocs) > 0 && m.selectedDocIdx >= 0 && m.selectedDocIdx < len(m.discoveredDocs) {
+				if m.selectedDocIdx >= 0 && m.selectedDocIdx < selectableCount && m.isSelectedDocVisible() {
 					selected := m.discoveredDocs[m.selectedDocIdx]
 					return m, openEditor(selected.absPath, 0)
 				}
 				return m, nil
 			case "enter":
-				if len(m.discoveredDocs) == 0 {
+				if m.selectedDocIdx < 0 || m.selectedDocIdx >= selectableCount || !m.isSelectedDocVisible() {
 					return m, nil
 				}
 				selected := m.discoveredDocs[m.selectedDocIdx]
@@ -1153,21 +1312,29 @@ func (m model) selectList(width, height int) string {
 		return b.String()
 	}
 
-	visibleHeight := max(1, height-4)
-	start := 0
-	if m.selectedDocIdx >= visibleHeight {
-		start = m.selectedDocIdx - visibleHeight + 1
-	}
-	end := min(len(m.discoveredDocs), start+visibleHeight)
+	start, end := m.selectVisibleRange()
+	numSelectable := m.numSelectableDocs()
+	hasDivider := numSelectable > 0 && numSelectable < len(m.discoveredDocs)
+	totalRows := m.totalSelectRows()
 
 	if start > 0 {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more above", start)))
+		docsAbove := start
+		if hasDivider && start > numSelectable {
+			docsAbove = start - 1
+		}
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more above", docsAbove)))
 		b.WriteByte('\n')
 	}
 
-	for idx := start; idx < end; idx++ {
-		doc := m.discoveredDocs[idx]
-		isSelected := idx == m.selectedDocIdx
+	for r := start; r < end; r++ {
+		doc, docIdx, isDivider := m.selectRowAt(r)
+		if isDivider {
+			b.WriteByte('\n')
+			continue
+		}
+
+		isComplete := doc.isComplete()
+		isSelected := !isComplete && docIdx == m.selectedDocIdx
 
 		sel := "  "
 		itemStyle := lipgloss.NewStyle()
@@ -1181,36 +1348,49 @@ func (m model) selectList(width, height int) string {
 			pct = (doc.doc.done * 100) / doc.doc.total
 		}
 
-		var pctBadge string
-		if pct == 100 {
-			pctBadge = doneStyle.Render(fmt.Sprintf("[%3d%%]", pct))
-		} else if doc.doc.blocked > 0 && doc.doc.pending == 0 {
-			pctBadge = warnStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+		var compText string
+		var numPrefix string
+
+		if isComplete {
+			itemStyle = mutedStyle
+			numPrefix = "      "
+			compText = mutedStyle.Render(fmt.Sprintf("[%3d%%] %d/%d completed", pct, doc.doc.done, doc.doc.total))
 		} else {
-			pctBadge = activeStyle.Render(fmt.Sprintf("[%3d%%]", pct))
-		}
+			var pctBadge string
+			if doc.doc.blocked > 0 && doc.doc.pending == 0 {
+				pctBadge = warnStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+			} else {
+				pctBadge = activeStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+			}
 
-		var detailParts []string
-		if doc.doc.done > 0 {
-			detailParts = append(detailParts, doneStyle.Render(fmt.Sprintf("%d done", doc.doc.done)))
-		}
-		if doc.doc.pending > 0 {
-			detailParts = append(detailParts, fmt.Sprintf("%d pending", doc.doc.pending))
-		}
-		if doc.doc.blocked > 0 {
-			detailParts = append(detailParts, warnStyle.Render(fmt.Sprintf("%d blocked", doc.doc.blocked)))
-		}
-		details := strings.Join(detailParts, ", ")
-		if details != "" {
-			details = " (" + details + ")"
-		}
+			var detailParts []string
+			if doc.doc.done > 0 {
+				detailParts = append(detailParts, doneStyle.Render(fmt.Sprintf("%d done", doc.doc.done)))
+			}
+			if doc.doc.pending > 0 {
+				detailParts = append(detailParts, fmt.Sprintf("%d pending", doc.doc.pending))
+			}
+			if doc.doc.blocked > 0 {
+				detailParts = append(detailParts, warnStyle.Render(fmt.Sprintf("%d blocked", doc.doc.blocked)))
+			}
+			details := strings.Join(detailParts, ", ")
+			if details != "" {
+				details = " (" + details + ")"
+			}
 
-		compText := fmt.Sprintf("%s %d/%d completed%s", pctBadge, doc.doc.done, doc.doc.total, details)
-		numPrefix := fmt.Sprintf("%s%2d. ", sel, idx+1)
+			compText = fmt.Sprintf("%s %d/%d completed%s", pctBadge, doc.doc.done, doc.doc.total, details)
+			numPrefix = fmt.Sprintf("%s%2d. ", sel, docIdx+1)
+		}
 
 		compWidth := lipgloss.Width(compText)
-		if width-compWidth-len(numPrefix)-1 < 15 && details != "" {
+		if !isComplete && width-compWidth-len(numPrefix)-1 < 15 && strings.Contains(compText, "(") {
 			// Drop detailed parenthetical if space is constrained
+			var pctBadge string
+			if doc.doc.blocked > 0 && doc.doc.pending == 0 {
+				pctBadge = warnStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+			} else {
+				pctBadge = activeStyle.Render(fmt.Sprintf("[%3d%%]", pct))
+			}
 			compText = fmt.Sprintf("%s %d/%d completed", pctBadge, doc.doc.done, doc.doc.total)
 			compWidth = lipgloss.Width(compText)
 		}
@@ -1231,8 +1411,13 @@ func (m model) selectList(width, height int) string {
 		b.WriteByte('\n')
 	}
 
-	if end < len(m.discoveredDocs) {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more below", len(m.discoveredDocs)-end)))
+	if end < totalRows {
+		docsRendered := end
+		if hasDivider && end > numSelectable {
+			docsRendered = end - 1
+		}
+		remainingDocs := len(m.discoveredDocs) - docsRendered
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more below", remainingDocs)))
 		b.WriteByte('\n')
 	}
 

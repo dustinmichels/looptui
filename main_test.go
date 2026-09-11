@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -254,15 +255,19 @@ func TestSelectModelNavigationAndSelection(t *testing.T) {
 	dir := t.TempDir()
 	p1 := filepath.Join(dir, "p1.md")
 	p2 := filepath.Join(dir, "p2.md")
+	p3 := filepath.Join(dir, "p3.md")
 	if err := os.WriteFile(p1, []byte("## S1\n- [ ] task 1\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p2, []byte("## S2\n- [x] task 2\n"), 0644); err != nil {
+	if err := os.WriteFile(p2, []byte("## S2\n- [ ] task 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p3, []byte("## S3\n- [x] task 3\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	docs, err := findChecklistDocuments(dir)
-	if err != nil || len(docs) != 2 {
+	if err != nil || len(docs) != 3 {
 		t.Fatalf("failed to find docs: %v, len=%d", err, len(docs))
 	}
 
@@ -276,11 +281,18 @@ func TestSelectModelNavigationAndSelection(t *testing.T) {
 		t.Fatalf("expected selectedDocIdx 0, got %d", m.selectedDocIdx)
 	}
 
-	// Down key moves to index 1
+	// Down key moves to index 1 (incomplete p2.md)
 	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = newM.(model)
 	if m.selectedDocIdx != 1 {
 		t.Fatalf("expected selectedDocIdx 1 after down/j, got %d", m.selectedDocIdx)
+	}
+
+	// Down key cannot move to index 2 (complete p3.md)
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx to stay 1 because p3.md is complete, got %d", m.selectedDocIdx)
 	}
 
 	// Up key moves back to index 0
@@ -295,6 +307,13 @@ func TestSelectModelNavigationAndSelection(t *testing.T) {
 	m = newM.(model)
 	if m.selectedDocIdx != 1 {
 		t.Fatalf("expected selectedDocIdx 1 after '2', got %d", m.selectedDocIdx)
+	}
+
+	// '3' key jumps to complete document -> rejected, remains at index 1
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx to stay 1 after '3' on complete doc, got %d", m.selectedDocIdx)
 	}
 
 	// Enter selects p2.md and transitions to modeRunner
@@ -364,19 +383,60 @@ func TestSelectModelEditorRefreshPreservesSelectedDocumentAcrossReorder(t *testi
 		t.Fatalf("expected discoveredDocs[1] to be a_doc.md, got %q", m.discoveredDocs[1].path)
 	}
 
-	// selectedDocIdx should have tracked a_doc.md to index 1
-	if m.selectedDocIdx != 1 {
-		t.Fatalf("expected selectedDocIdx to relocate to 1 for a_doc.md, got %d", m.selectedDocIdx)
+	// a_doc.md is now complete, so it is unselectable. Selection stays on index 0 (b_doc.md).
+	if m.selectedDocIdx != 0 {
+		t.Fatalf("expected selectedDocIdx to be 0 for b_doc.md, got %d", m.selectedDocIdx)
 	}
 
-	// Pressing Enter should now open a_doc.md
+	// Pressing Enter should now open b_doc.md
 	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = newM.(model)
 	if m.mode != modeRunner {
 		t.Fatalf("expected modeRunner, got %v", m.mode)
 	}
-	if m.cfg.document != docs[0].absPath {
-		t.Fatalf("expected cfg.document %q, got %q", docs[0].absPath, m.cfg.document)
+	if m.cfg.document != docs[1].absPath {
+		t.Fatalf("expected cfg.document %q, got %q", docs[1].absPath, m.cfg.document)
+	}
+}
+
+func TestSelectModelAllComplete(t *testing.T) {
+	dir := t.TempDir()
+	p1 := filepath.Join(dir, "done1.md")
+	p2 := filepath.Join(dir, "done2.md")
+	if err := os.WriteFile(p1, []byte("## S1\n- [x] task 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p2, []byte("## S2\n- [x] task 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := findChecklistDocuments(dir)
+	if err != nil || len(docs) != 2 {
+		t.Fatalf("failed to find docs: %v", err)
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+
+	if m.selectedDocIdx != -1 {
+		t.Fatalf("expected selectedDocIdx -1 when all docs are complete, got %d", m.selectedDocIdx)
+	}
+	if m.status != "All documents are complete" {
+		t.Fatalf("expected status 'All documents are complete', got %q", m.status)
+	}
+
+	// Navigation keys do nothing
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(model)
+	if m.selectedDocIdx != -1 {
+		t.Fatalf("expected selectedDocIdx still -1 after j, got %d", m.selectedDocIdx)
+	}
+
+	// Enter does nothing
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeSelect {
+		t.Fatalf("expected modeSelect, got %v", m.mode)
 	}
 }
 
@@ -419,7 +479,316 @@ func TestSelectViewRendersRelativePathsAndCompleteness(t *testing.T) {
 		t.Errorf("view does not contain completeness for root-tasks.md:\n%s", view)
 	}
 }
+func TestSelectViewRendersSpaceAndGreyedOutForCompleteDocs(t *testing.T) {
+	doc1 := document{total: 4, done: 2, pending: 2}
+	doc2 := document{total: 5, done: 5}
+	docs := []checklistDoc{
+		{path: "active.md", absPath: "/tmp/active.md", doc: doc1},
+		{path: "finished.md", absPath: "/tmp/finished.md", doc: doc2},
+	}
+	m := newSelectModel(config{document: ""}, docs)
+	m.width = 100
+	m.height = 30
 
+	view := m.View()
+	// Complete doc should not have a number prefix like " 2. finished.md"
+	if strings.Contains(view, "2. finished.md") {
+		t.Errorf("complete document should not be numbered:\n%s", view)
+	}
+	if !strings.Contains(view, "finished.md") {
+		t.Errorf("complete document should be listed:\n%s", view)
+	}
+
+	lines := strings.Split(view, "\n")
+	activeLine := -1
+	finishedLine := -1
+	for i, l := range lines {
+		if strings.Contains(l, "active.md") {
+			activeLine = i
+		}
+		if strings.Contains(l, "finished.md") {
+			finishedLine = i
+		}
+	}
+	if activeLine == -1 || finishedLine == -1 {
+		t.Fatalf("could not find lines for active.md and finished.md:\n%s", view)
+	}
+	if finishedLine != activeLine+2 {
+		t.Fatalf("expected finished.md to be exactly 2 lines after active.md (with 1 blank line between), got active=%d, finished=%d:\n%s", activeLine, finishedLine, view)
+	}
+
+	// Verify the intervening line is actually blank (excluding panel borders/spaces)
+	intervening := strings.Trim(lines[activeLine+1], "│ ")
+	if intervening != "" {
+		t.Errorf("expected blank line between active.md and finished.md, got %q", lines[activeLine+1])
+	}
+
+	// Verify greyed-out muted styling on completed row
+	expectedMutedComp := mutedStyle.Render("[100%] 5/5 completed")
+	if !strings.Contains(lines[finishedLine], expectedMutedComp) {
+		t.Errorf("expected finished.md line to contain muted completion string %q, line was:\n%s", expectedMutedComp, lines[finishedLine])
+	}
+
+	// Verify active row is not wholly muted (contains active badge)
+	expectedActiveBadge := activeStyle.Render("[ 50%]")
+	if !strings.Contains(lines[activeLine], expectedActiveBadge) {
+		t.Errorf("expected active.md line to contain active badge %q, line was:\n%s", expectedActiveBadge, lines[activeLine])
+	}
+}
+
+func TestSelectModelAllCompleteScroll(t *testing.T) {
+	var docs []checklistDoc
+	for i := range 15 {
+		docs = append(docs, checklistDoc{
+			path:    fmt.Sprintf("done_%02d.md", i),
+			absPath: fmt.Sprintf("/tmp/done_%02d.md", i),
+			doc:     document{total: 2, done: 2},
+		})
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+	m.width = 100
+	m.height = 10 // small height so visibleHeight is ~4 lines
+
+	if m.selectedDocIdx != -1 {
+		t.Fatalf("expected selectedDocIdx -1 for all complete, got %d", m.selectedDocIdx)
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "done_00.md") {
+		t.Errorf("initial view should show done_00.md:\n%s", view)
+	}
+	if !strings.Contains(view, "more below") {
+		t.Errorf("initial view should indicate more below:\n%s", view)
+	}
+	if strings.Contains(view, "done_14.md") {
+		t.Errorf("done_14.md should not be visible before scrolling:\n%s", view)
+	}
+	// Scroll down step-by-step using 'j' to verify repeated j reaches the end
+	for range 20 {
+		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = newM.(model)
+	}
+
+	viewScrolled := m.View()
+	if !strings.Contains(viewScrolled, "done_14.md") {
+		t.Errorf("scrolled view after repeated 'j' should show final doc done_14.md:\n%s", viewScrolled)
+	}
+	if !strings.Contains(viewScrolled, "more above") {
+		t.Errorf("scrolled view should indicate more above:\n%s", viewScrolled)
+	}
+
+	// Selection should remain -1
+	if m.selectedDocIdx != -1 {
+		t.Fatalf("selectedDocIdx should remain -1 after scrolling, got %d", m.selectedDocIdx)
+	}
+
+	// Enter key should not select or transition
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeSelect {
+		t.Fatalf("enter should not leave modeSelect when all are complete, got %v", m.mode)
+	}
+}
+
+func TestSelectModelMixedScrollPastSelectable(t *testing.T) {
+	dir := t.TempDir()
+	p0 := filepath.Join(dir, "incomplete_0.md")
+	p1 := filepath.Join(dir, "incomplete_1.md")
+	if err := os.WriteFile(p0, []byte("## S0\n- [ ] task 0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p1, []byte("## S1\n- [ ] task 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var docs []checklistDoc
+	// 2 incomplete docs
+	docs = append(docs, checklistDoc{
+		path:    "incomplete_0.md",
+		absPath: p0,
+		doc:     document{total: 2, done: 1, pending: 1},
+	})
+	docs = append(docs, checklistDoc{
+		path:    "incomplete_1.md",
+		absPath: p1,
+		doc:     document{total: 2, done: 0, pending: 2},
+	})
+	// 10 complete docs
+	for i := range 10 {
+		docs = append(docs, checklistDoc{
+			path:    fmt.Sprintf("done_%02d.md", i),
+			absPath: filepath.Join(dir, fmt.Sprintf("done_%02d.md", i)),
+			doc:     document{total: 3, done: 3},
+		})
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+	m.width = 100
+	m.height = 10 // small height
+
+	if m.selectedDocIdx != 0 {
+		t.Fatalf("expected selectedDocIdx 0, got %d", m.selectedDocIdx)
+	}
+
+	// Move down to index 1 (second incomplete doc)
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("expected selectedDocIdx 1, got %d", m.selectedDocIdx)
+	}
+
+	// Pressing 'j' again cannot advance selectedDocIdx (p3 is complete)
+	// but it scrolls down
+	initScroll := m.selectScroll
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(model)
+	if m.selectedDocIdx != 1 {
+		t.Fatalf("selectedDocIdx should stay 1, got %d", m.selectedDocIdx)
+	}
+	if m.selectScroll <= initScroll {
+		t.Fatalf("selectScroll should have incremented to reveal complete docs, was %d, now %d", initScroll, m.selectScroll)
+	}
+
+	// Repeatedly press 'j' until bottom scroll is reached
+	for range 15 {
+		newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m = newM.(model)
+		if m.selectedDocIdx != 1 {
+			t.Fatalf("selectedDocIdx must remain on selectable doc (1), got %d", m.selectedDocIdx)
+		}
+	}
+	finalView := m.View()
+	if !strings.Contains(finalView, "done_09.md") {
+		t.Errorf("final completed doc done_09.md should be visible after repeated 'j':\n%s", finalView)
+	}
+
+	// Incomplete docs are now off-screen: enter and e must not act on off-screen selection
+	if strings.Contains(finalView, "incomplete_1.md") {
+		t.Fatalf("incomplete_1.md should be off-screen at bottom scroll, but was in view:\n%s", finalView)
+	}
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeSelect {
+		t.Fatalf("enter must not launch off-screen document; expected modeSelect, got %v", m.mode)
+	}
+
+	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = newM.(model)
+	if cmd != nil {
+		t.Fatal("e must not open editor on off-screen document")
+	}
+
+	// Pressing home ('g') reveals the selected document again
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = newM.(model)
+	homeView := m.View()
+	if !strings.Contains(homeView, "incomplete_0.md") {
+		t.Fatalf("homeView should contain incomplete_0.md:\n%s", homeView)
+	}
+
+	// Now enter works to launch the visible selected document
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = newM.(model)
+	if m.mode != modeRunner {
+		t.Fatalf("expected modeRunner after enter on visible selection, got %v", m.mode)
+	}
+}
+
+func TestSelectModelWindowResizeClampsScroll(t *testing.T) {
+	var docs []checklistDoc
+	for i := range 10 {
+		docs = append(docs, checklistDoc{
+			path:    fmt.Sprintf("done_%02d.md", i),
+			absPath: fmt.Sprintf("/tmp/done_%02d.md", i),
+			doc:     document{total: 1, done: 1},
+		})
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+	m.width = 100
+	m.height = 10 // small height
+
+	// Scroll to bottom
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	m = newM.(model)
+	if m.selectScroll == 0 {
+		t.Fatal("expected selectScroll > 0 after scrolling to bottom")
+	}
+
+	// Enlarge terminal height to 40 so all 10 docs fit without scrolling
+	newM, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = newM.(model)
+	if m.selectScroll != 0 {
+		t.Fatalf("expected selectScroll clamped to 0 after enlarging window, got %d", m.selectScroll)
+	}
+}
+
+func TestSelectModelManyIncompleteNavigation(t *testing.T) {
+	dir := t.TempDir()
+	var docs []checklistDoc
+	for i := range 15 {
+		p := filepath.Join(dir, fmt.Sprintf("task_%02d.md", i))
+		if err := os.WriteFile(p, []byte("## S\n- [ ] task\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		docs = append(docs, checklistDoc{
+			path:    fmt.Sprintf("task_%02d.md", i),
+			absPath: p,
+			doc:     document{total: 1, pending: 1},
+		})
+	}
+
+	cfg := config{ompPath: "/bin/echo"}
+	m := newSelectModel(cfg, docs)
+	m.width = 100
+	m.height = 9 // small height: visibleHeight is ~3-4 lines
+
+	// Step-by-step navigate down through all 15 incomplete items
+	for expectedIdx := range 15 {
+		if m.selectedDocIdx != expectedIdx {
+			t.Fatalf("expected selectedDocIdx %d, got %d", expectedIdx, m.selectedDocIdx)
+		}
+		if !m.isSelectedDocVisible() {
+			t.Fatalf("cursor at idx %d must be visible in viewport, scroll=%d", expectedIdx, m.selectScroll)
+		}
+		view := m.View()
+		expectedName := fmt.Sprintf("task_%02d.md", expectedIdx)
+		if !strings.Contains(view, expectedName) {
+			t.Fatalf("view at step %d must contain %s:\n%s", expectedIdx, expectedName, view)
+		}
+		if !strings.Contains(view, "> ") {
+			t.Fatalf("view at step %d must show active cursor '> ':\n%s", expectedIdx, view)
+		}
+
+		if expectedIdx < 14 {
+			newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+			m = newM.(model)
+		}
+	}
+
+	// Step-by-step navigate back up to 0
+	for expectedIdx := 14; expectedIdx >= 0; expectedIdx-- {
+		if m.selectedDocIdx != expectedIdx {
+			t.Fatalf("expected selectedDocIdx %d while moving up, got %d", expectedIdx, m.selectedDocIdx)
+		}
+		if !m.isSelectedDocVisible() {
+			t.Fatalf("cursor at idx %d must be visible in viewport while moving up, scroll=%d", expectedIdx, m.selectScroll)
+		}
+		view := m.View()
+		expectedName := fmt.Sprintf("task_%02d.md", expectedIdx)
+		if !strings.Contains(view, expectedName) {
+			t.Fatalf("view at step %d must contain %s while moving up:\n%s", expectedIdx, expectedName, view)
+		}
+		if expectedIdx > 0 {
+			newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+			m = newM.(model)
+		}
+	}
+}
 func TestStopCaffeinateTerminatesChild(t *testing.T) {
 	cmd := exec.Command("sleep", "60")
 	if err := cmd.Start(); err != nil {
