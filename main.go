@@ -155,7 +155,6 @@ func loadConfig(args []string) (config, error) {
 		sleep:       2 * time.Second,
 		autoApprove: os.Getenv("AUTO_APPROVE") != "0",
 	}
-
 	if value := os.Getenv("STALL_LIMIT"); value != "" {
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 {

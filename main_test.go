@@ -72,6 +72,9 @@ func TestBuildOMPArgsScopesRunToOneSection(t *testing.T) {
 	if !strings.Contains(prompt, `"Backend service"`) || !strings.Contains(prompt, "line 42") || !strings.Contains(prompt, "continue with the remaining unchecked tasks") {
 		t.Fatalf("prompt does not instruct continuing after blocked tasks: %q", prompt)
 	}
+	if !strings.Contains(prompt, "- **Issue:**") || !strings.Contains(prompt, "- **User input:**") {
+		t.Fatalf("prompt missing issue format or user input handling: %q", prompt)
+	}
 	if !reflect.DeepEqual(args[len(args)-2:], []string{"--model", "opus"}) {
 		t.Fatalf("extra arguments not preserved: %#v", args)
 	}
@@ -1308,3 +1311,65 @@ func TestDemoDocumentParsing(t *testing.T) {
 		t.Errorf("unexpected issue part: %q", issuePart)
 	}
 }
+
+func TestFormatTokens(t *testing.T) {
+	tests := []struct {
+		input int
+		want  string
+	}{
+		{0, "0"},
+		{-5, "0"},
+		{500, "500"},
+		{1200, "1.2k"},
+		{9800, "9.8k"},
+		{45000, "45k"},
+		{100000, "100k"},
+		{1500000, "1.5m"},
+	}
+
+	for _, tc := range tests {
+		if got := formatTokens(tc.input); got != tc.want {
+			t.Errorf("formatTokens(%d) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRenderOMPEventExtractsUsage(t *testing.T) {
+	jsonLine := []byte(`{"type":"turn_end","message":{"role":"assistant","usage":{"input":4158,"cacheRead":16312,"output":350,"totalTokens":20820}}}`)
+	outputs := renderOMPEvent(jsonLine)
+	var foundUsage *contextUsage
+	for _, out := range outputs {
+		if out.kind == outputUsage {
+			u := out.usage
+			foundUsage = &u
+			break
+		}
+	}
+	if foundUsage == nil {
+		t.Fatal("expected outputUsage event from turn_end with usage")
+	}
+	if foundUsage.Input != 4158 || foundUsage.CacheRead != 16312 || foundUsage.Output != 350 || foundUsage.TotalTokens != 20820 {
+		t.Fatalf("unexpected usage: %+v", foundUsage)
+	}
+	if got := foundUsage.ActiveContext(); got != 4158+16312 {
+		t.Fatalf("ActiveContext() = %d, want %d", got, 4158+16312)
+	}
+}
+
+func TestRenderHeaderTitleIncludesContextUsage(t *testing.T) {
+	m := model{
+		cfg:           config{},
+		modelName:     "gemini-3.8-flash",
+		contextTokens: 45000,
+	}
+	base := " LOOP tasks.md"
+	rendered := m.renderHeaderTitle(base, 100)
+	if !strings.Contains(rendered, "45k ctx") {
+		t.Errorf("expected header to contain context info '45k ctx', got %q", rendered)
+	}
+	if !strings.Contains(rendered, "gemini-3.8-flash") {
+		t.Errorf("expected header to contain model name, got %q", rendered)
+	}
+}
+
+

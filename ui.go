@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,9 +64,9 @@ type model struct {
 	width  int
 	height int
 
-	mode      uiMode
-	modelName string
-
+	mode          uiMode
+	modelName     string
+	contextTokens int
 	discoveredDocs []checklistDoc
 	selectedDocIdx int
 	selectScroll   int
@@ -691,6 +692,16 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.iteration++
 			return m.finishRun(msg.output.exitCode)
 		}
+		if msg.output.kind == outputUsage {
+			active := msg.output.usage.ActiveContext()
+			if active > 0 {
+				m.contextTokens = active
+			}
+			if m.run != nil {
+				return m, waitForAgent(m.run.events)
+			}
+			return m, nil
+		}
 		if msg.output.kind == outputModel {
 			if msg.output.text != "" {
 				m.modelName = msg.output.text
@@ -783,10 +794,10 @@ func (m *model) prepareRun() {
 	}
 	m.current = target
 	m.runStartPending = m.doc.pending
+	m.contextTokens = 0
 	m.starting = true
 	m.status = fmt.Sprintf("Starting section: %s", target.title)
 }
-
 func (m model) startNextRun() (tea.Model, tea.Cmd) {
 	m.prepareRun()
 	if !m.starting {
@@ -959,45 +970,121 @@ func (m model) headerView(width int) string {
 }
 
 func (m model) renderHeaderTitle(base string, availWidth int) string {
-	if m.modelName == "" {
-		if len(base) > availWidth && availWidth > 0 {
-			return headerStyle.Render(truncate(base, availWidth))
-		}
-		return headerStyle.Render(base)
-	}
-
-	baseWidth := len(base)
-	dotWidth := 3 // " · "
-	remain := availWidth - baseWidth - dotWidth
-	if remain <= 0 {
-		if len(base) > availWidth && availWidth > 0 {
-			return headerStyle.Render(truncate(base, availWidth))
-		}
-		return headerStyle.Render(base)
+	ctxText := ""
+	var ctxStyled string
+	if m.contextTokens > 0 {
+		ctxText = fmt.Sprintf("%s ctx", formatTokens(m.contextTokens))
+		ctxStyled = mutedStyle.Render(ctxText)
 	}
 
 	modelDisp := m.modelName
-	if len(modelDisp) > remain && strings.Contains(modelDisp, "/") {
-		parts := strings.SplitN(modelDisp, "/", 2)
-		if len(parts) == 2 && parts[1] != "" {
-			modelDisp = parts[1]
-		}
+	dot := mutedStyle.Render(" · ")
+	dotLen := 3
+
+	// First attempt: base + full model + ctxText
+	totalNeeded := len(base)
+	if modelDisp != "" {
+		totalNeeded += dotLen + len(modelDisp)
 	}
-	if len(modelDisp) > remain {
-		if remain > 4 {
-			modelDisp = truncate(modelDisp, remain)
-		} else {
-			modelDisp = ""
+	if ctxText != "" {
+		totalNeeded += dotLen + len(ctxText)
+	}
+
+	if totalNeeded <= availWidth {
+		res := headerStyle.Render(base)
+		if modelDisp != "" {
+			res += dot + activeStyle.Render(modelDisp)
+		}
+		if ctxText != "" {
+			res += dot + ctxStyled
+		}
+		return res
+	}
+
+	// If it doesn't fit with full model, try stripping provider prefix from model:
+	strippedModel := modelDisp
+	if strings.Contains(strippedModel, "/") {
+		parts := strings.SplitN(strippedModel, "/", 2)
+		if len(parts) == 2 && parts[1] != "" {
+			strippedModel = parts[1]
 		}
 	}
 
-	if modelDisp != "" {
-		return headerStyle.Render(base) + mutedStyle.Render(" · ") + activeStyle.Render(modelDisp)
+	totalWithStripped := len(base)
+	if strippedModel != "" {
+		totalWithStripped += dotLen + len(strippedModel)
 	}
+	if ctxText != "" {
+		totalWithStripped += dotLen + len(ctxText)
+	}
+
+	if totalWithStripped <= availWidth {
+		res := headerStyle.Render(base)
+		if strippedModel != "" {
+			res += dot + activeStyle.Render(strippedModel)
+		}
+		if ctxText != "" {
+			res += dot + ctxStyled
+		}
+		return res
+	}
+
+	// Next attempt: base + full model (without ctxText)
+	neededFullModelOnly := len(base)
+	if modelDisp != "" {
+		neededFullModelOnly += dotLen + len(modelDisp)
+	}
+	if neededFullModelOnly <= availWidth {
+		res := headerStyle.Render(base)
+		if modelDisp != "" {
+			res += dot + activeStyle.Render(modelDisp)
+		}
+		return res
+	}
+
+	// Next attempt: base + stripped model (without ctxText)
+	neededStrippedModelOnly := len(base)
+	if strippedModel != "" {
+		neededStrippedModelOnly += dotLen + len(strippedModel)
+	}
+	if neededStrippedModelOnly <= availWidth {
+		res := headerStyle.Render(base)
+		if strippedModel != "" {
+			res += dot + activeStyle.Render(strippedModel)
+		}
+		return res
+	}
+
+	// Next: truncate strippedModel if space allows
+	remainForModel := availWidth - len(base) - dotLen
+	if strippedModel != "" && remainForModel > 4 {
+		shortModel := truncate(strippedModel, remainForModel)
+		return headerStyle.Render(base) + dot + activeStyle.Render(shortModel)
+	}
+
+	// Fallback to base
 	if len(base) > availWidth && availWidth > 0 {
 		return headerStyle.Render(truncate(base, availWidth))
 	}
 	return headerStyle.Render(base)
+}
+
+func formatTokens(n int) string {
+	if n <= 0 {
+		return "0"
+	}
+	if n < 1000 {
+		return strconv.Itoa(n)
+	}
+	if n < 10000 {
+		val := float64(n) / 1000.0
+		return fmt.Sprintf("%.1fk", val)
+	}
+	if n < 1000000 {
+		return fmt.Sprintf("%dk", (n+500)/1000)
+	}
+	val := float64(n) / 1000000.0
+	return fmt.Sprintf("%.1fm", val)
 }
 
 func (m model) progressView(width, height int) string {

@@ -56,7 +56,14 @@ Extra arguments after the document are forwarded to `omp`:
 looptui path/to/migration.md --model opus
 ```
 
-The active model is displayed in the top header (e.g. `LOOP migration.md · opus`) in both runner and review modes. It is detected from `--model` CLI arguments, OMP configuration (`~/.omp/agent/config.yml`), or dynamically updated from `omp` runtime events.
+The active model and live context usage are displayed in the top header (e.g. `LOOP migration.md · opus · 42k/100k ctx`) in runner mode. The model is detected from `--model` CLI arguments, OMP configuration (`~/.omp/agent/config.yml`), or dynamically updated from `omp` runtime events. Context token metrics (`input + cacheRead`) update live with each turn.
+
+### Context evaluation & agent rotation
+
+To prevent agents from getting bogged down in large contexts when executing multiple tasks in a section:
+- The prompt directs the agent to evaluate remaining context after each task completion. If context has grown large, it checks off the task (`- [x]`) and stops cleanly.
+- `looptui` automatically detects the task progress, starts a new run with a fresh agent targeting the remaining tasks, and resets the context window.
+- As a safety guard, `looptui` also monitors active token usage: if context reaches `CONTEXT_LIMIT` after at least one task is completed, it rotates to a fresh agent automatically.
 If no document is passed, `looptui` uses `$DOC` if set; otherwise it automatically scans the current directory and subdirectories for markdown files with checklists and presents an interactive selection list noting the relative path and completion status for each file, sorting incomplete files up top and complete ones (100%) at the bottom.
 
 `looptui` automatically runs macOS `caffeinate` (`caffeinate -d -i -w <looptui-pid>`) in the background along with the TUI without prompting, keeping your computer awake while the loop is active. It is stopped and reaped when `looptui` exits, including via `q` or `ctrl+c`.
@@ -102,11 +109,11 @@ When one or more tasks are marked `- [!]`, press `i` to enter review mode:
 
 - `AUTO_APPROVE=0`: omit `--auto-approve` when launching `omp`; by default it is included.
 - `OMP_BIN=/path/to/omp`: use a specific `omp` binary.
+- `CONTEXT_LIMIT=N`: max context tokens before rotating to a fresh agent (e.g. `80k`, `100000`; `0` disables; default `100000`).
 - `MAX_ITERATIONS=N`: stop after `N` `omp` runs; `0` means unlimited.
 - `STALL_LIMIT=N`: stop after `N` consecutive runs with no checkbox progress; default `3`.
 - `SLEEP_SECONDS=N`: delay between automatic runs; default `2`.
 - `DOC=path/to/file.md`: default document when no document argument is supplied.
-
 ## Exit codes
 
 - `0`: all tasks complete or user exited normally.

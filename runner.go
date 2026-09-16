@@ -21,12 +21,29 @@ const (
 	outputDelta
 	outputDone
 	outputModel
+	outputUsage
 )
+
+type contextUsage struct {
+	Input       int
+	CacheRead   int
+	Output      int
+	TotalTokens int
+}
+
+func (u contextUsage) ActiveContext() int {
+	active := u.Input + u.CacheRead
+	if active == 0 && u.TotalTokens > 0 {
+		return u.TotalTokens
+	}
+	return active
+}
 
 type agentOutput struct {
 	kind     outputKind
 	text     string
 	exitCode int
+	usage    contextUsage
 }
 
 type agentRun struct {
@@ -43,6 +60,14 @@ type agentOutputMsg struct {
 	output agentOutput
 }
 
+type ompUsage struct {
+	Input       int `json:"input"`
+	Output      int `json:"output"`
+	CacheRead   int `json:"cacheRead"`
+	CacheWrite  int `json:"cacheWrite"`
+	TotalTokens int `json:"totalTokens"`
+}
+
 type ompEvent struct {
 	Type                  string          `json:"type"`
 	Model                 string          `json:"model,omitempty"`
@@ -50,14 +75,16 @@ type ompEvent struct {
 	Intent                string          `json:"intent,omitempty"`
 	Args                  json.RawMessage `json:"args,omitempty"`
 	IsError               bool            `json:"isError,omitempty"`
+	Usage                 *ompUsage       `json:"usage,omitempty"`
 	AssistantMessageEvent *struct {
 		Type  string `json:"type"`
 		Delta string `json:"delta,omitempty"`
 	} `json:"assistantMessageEvent,omitempty"`
 	Message *struct {
-		Role     string `json:"role,omitempty"`
-		Model    string `json:"model,omitempty"`
-		Provider string `json:"provider,omitempty"`
+		Role     string    `json:"role,omitempty"`
+		Model    string    `json:"model,omitempty"`
+		Provider string    `json:"provider,omitempty"`
+		Usage    *ompUsage `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
 }
 
@@ -102,7 +129,16 @@ func buildOMPArgs(cfg config, target section) []string {
 
 func sectionPrompt(documentPath string, target section) string {
 	return fmt.Sprintf(`Work only on the next incomplete document section: %q (starts at line %d in %s).
-Implement its unchecked tasks in order and update each completed checkbox to '- [x]' in the document as you go. Do not start a later section in this run. If a task cannot be completed or requires user input, rewrite its checkbox as '- [!]' with the blocking issue inline on the same bullet, then continue with the remaining unchecked tasks in this section. Never leave '- [ ]' on work you already completed or determined is blocked.`, target.title, target.line, documentPath)
+Implement its unchecked tasks in order. Do not start a later section in this run.
+
+Rules:
+1. Verification: Before marking a task complete, verify your work (run relevant tests, builds, or checks). Once verified, change the checkbox to '- [x]' in the document as you go.
+2. Blocked tasks: If a task genuinely cannot proceed without human input, credentials, or external decisions, rewrite its checkbox as '- [!] <task> - **Issue:** <explanation>' on the same bullet, then continue with the remaining unchecked tasks in this section. Do not mark blocked for ordinary debugging or errors you can resolve yourself.
+3. User input: Unchecked tasks may contain '- **User input:** <guidance>' from a prior run. Treat this as authoritative user direction resolving a previous blocker.
+4. Context & Rotation: After completing each task and updating its checkbox, evaluate if you should continue:
+   - If conversation context has grown large (heavy research, edits, or multiple turns), or you might risk running low on context, STOP and conclude your response cleanly. looptui will detect your progress and launch a fresh agent with a clean context window for the remaining tasks.
+   - If you still have plenty of context, continue with the remaining unchecked tasks in this section.
+5. Invariant: Never leave '- [ ]' on work you already completed or determined is blocked. Preserve all other document lines and formatting.`, target.title, target.line, documentPath)
 }
 
 func collectAgentOutput(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.ReadCloser, events chan<- agentOutput) {
@@ -179,6 +215,24 @@ func renderOMPEvent(line []byte) []agentOutput {
 	}
 	if model != "" {
 		outputs = append(outputs, agentOutput{kind: outputModel, text: model})
+	}
+
+	var u *ompUsage
+	if event.Usage != nil {
+		u = event.Usage
+	} else if event.Message != nil && event.Message.Usage != nil {
+		u = event.Message.Usage
+	}
+	if u != nil && (u.Input > 0 || u.CacheRead > 0 || u.TotalTokens > 0) {
+		outputs = append(outputs, agentOutput{
+			kind: outputUsage,
+			usage: contextUsage{
+				Input:       u.Input,
+				CacheRead:   u.CacheRead,
+				Output:      u.Output,
+				TotalTokens: u.TotalTokens,
+			},
+		})
 	}
 
 	switch event.Type {
